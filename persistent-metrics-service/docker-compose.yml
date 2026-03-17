@@ -1,0 +1,48 @@
+services:
+  yugabytedb:
+    image: yugabytedb/yugabyte:2024.2.1.0-b185
+    command:
+      - bin/yugabyted
+      - start
+      - --daemon=false
+    ports:
+      - "5433:5433"   # YSQL (PostgreSQL-compatible)
+      - "7000:7000"   # Master web UI
+      - "9000:9000"   # TServer web UI
+      - "15433:15433" # YSQL admin UI
+    environment:
+      - YSQL_USER=yugabyte
+      - YSQL_PASSWORD=yugabyte
+      - YSQL_DB=yugabyte
+    volumes:
+      - yb-data:/root/var
+    healthcheck:
+      test: ["CMD", "ysqlsh", "-U", "yugabyte", "-c", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    depends_on:
+      - example-app
+
+  example-app:
+    build:
+      context: ./example-app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+
+volumes:
+  yb-data:
+  prometheus-data:
