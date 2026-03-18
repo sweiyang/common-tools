@@ -12,7 +12,7 @@ A FastAPI relay that makes Prometheus counter metrics durable. It polls Promethe
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.yaml.example config.yaml  # then edit api_key and DB URL
+cp config.yaml.example config.yaml  # then edit api_key and DB settings
 ```
 
 **Run the service:**
@@ -44,22 +44,33 @@ Source App → Prometheus → [this service polls via jobs] → YugabyteDB → G
 - Counter reset detection: if the new raw value < the previous raw value, the checkpoint is advanced by the previous raw value, and accumulation continues seamlessly
 - `counter_states` stores one row per (job, metric_name, labels) with `last_raw_value` and `checkpoint`; `counter_samples` is the append-only history
 - Labels are stored as JSONB with a GIN index for flexible querying
-- The scheduler bridges sync APScheduler → async coroutines via `asyncio.run()` in `_run_async()`
+- All DB operations are **sync** (psycopg2 driver, sync SQLAlchemy sessions)
+- The `Database` class (`src/core/db/db.py`) handles schema creation, search_path, column sync, and table creation
 - `/metrics` is unauthenticated; all `/jobs/*` endpoints require `X-API-Key` header
-- DB tables are created on startup via SQLAlchemy `create_all` (no migrations)
+- DB tables are created on startup via `db.sync_schema()` + `db.create_tables()`
+- Logging uses loguru via `src/core/logging.py` (`setup_logging()` / `get_logger()`)
 
 ## Configuration
 
-Config is loaded from `config.yaml` (path overridable via `CONFIG_PATH` env var):
+Config is loaded from `config.yaml` (path overridable via `CONFIG_PATH` env var). Environment-aware DB config via `APP_ENV` env var (defaults to `"prod"`):
 
 ```yaml
 database:
-  url: "postgresql+asyncpg://yugabyte:yugabyte@localhost:5433/yugabyte"
+  prod:
+    host: "localhost"
+    port: 5433
+    dbname: "yugabyte"
+    user: "yugabyte"
+    credential: "yugabyte"
+    schema: "metrics"
 auth:
   api_key: "your-secret-key"
 server:
   host: "0.0.0.0"
   port: 8000
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} - {extra[name]} - {level} - {message}"
 ```
 
-YugabyteDB is PostgreSQL-compatible (YSQL). The asyncpg driver is used throughout.
+YugabyteDB is PostgreSQL-compatible (YSQL). The psycopg2 driver is used throughout.

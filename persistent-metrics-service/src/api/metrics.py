@@ -3,10 +3,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
-from src.core.database import get_db
-from src.models.counter_state import CounterState
+from src.core.db import get_db
+from src.core.db.db_models import CounterState
 
 router = APIRouter(tags=["metrics"])
 
@@ -38,8 +38,8 @@ def _render_prometheus(rows: list[CounterState]) -> str:
     response_class=PlainTextResponse,
     summary="Prometheus metrics endpoint",
 )
-async def get_metrics(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(
+async def get_metrics(db: Session = Depends(get_db)):
+    result = db.execute(
         select(CounterState).order_by(CounterState.metric_name)
     )
     rows = result.scalars().all()

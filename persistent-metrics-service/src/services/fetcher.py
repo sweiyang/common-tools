@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from src.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -17,7 +18,7 @@ class Sample:
     timestamp: datetime
 
 
-async def fetch_instant(
+def fetch_instant(
     prometheus_url: str,
     query: str,
     timeout: float = 30.0,
@@ -26,13 +27,13 @@ async def fetch_instant(
     url = f"{prometheus_url.rstrip('/')}/api/v1/query"
     params = {"query": query}
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(url, params=params)
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.get(url, params=params)
         resp.raise_for_status()
 
     body = resp.json()
     if body.get("status") != "success":
-        logger.error("Prometheus query failed: %s", body.get("error", "unknown"))
+        logger.error("Prometheus query failed: {}", body.get("error", "unknown"))
         return []
 
     samples: list[Sample] = []
@@ -54,5 +55,5 @@ async def fetch_instant(
             )
         )
 
-    logger.info("Fetched %d samples for query=%s", len(samples), query)
+    logger.info("Fetched {} samples for query={}", len(samples), query)
     return samples

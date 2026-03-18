@@ -1,22 +1,20 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 import uuid
 from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
-from src.core.database import async_session
-from src.models.job import Job
+from src.core.db import get_db_instance
+from src.core.db.db_models import Job
+from src.core.logging import get_logger
 from src.services.fetcher import fetch_instant
 from src.services.metrics_repository import process_samples
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _scheduler: BackgroundScheduler | None = None
-_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_scheduler() -> BackgroundScheduler:
@@ -26,39 +24,37 @@ def _get_scheduler() -> BackgroundScheduler:
     return _scheduler
 
 
-def _run_async(coro):
-    """Run an async coroutine from the sync APScheduler thread."""
-    loop = _loop or asyncio.new_event_loop()
-    return loop.run_until_complete(coro)
-
-
-async def _execute_job(job_id: uuid.UUID) -> None:
-    async with async_session() as session:
-        job = await session.get(Job, job_id)
+def _execute_job(job_id: uuid.UUID) -> None:
+    db = get_db_instance()
+    session = db.get_session()
+    try:
+        job = session.get(Job, job_id)
         if job is None or not job.enabled:
-            logger.warning("Job %s not found or disabled, skipping", job_id)
+            logger.warning("Job {} not found or disabled, skipping", job_id)
             return
 
         now = datetime.now(timezone.utc)
 
         try:
-            samples = await fetch_instant(
+            samples = fetch_instant(
                 prometheus_url=job.prometheus_url,
                 query=job.query,
             )
         except Exception:
-            logger.exception("Fetch failed for job %s", job_id)
+            logger.exception("Fetch failed for job {}", job_id)
             return
 
-        await process_samples(session, job_id, samples, fetched_at=now)
+        process_samples(session, job_id, samples, fetched_at=now)
+    finally:
+        session.close()
 
 
 def _job_tick(job_id: uuid.UUID) -> None:
     """Sync wrapper invoked by APScheduler."""
     try:
-        _run_async(_execute_job(job_id))
+        _execute_job(job_id)
     except Exception:
-        logger.exception("Error in scheduled tick for job %s", job_id)
+        logger.exception("Error in scheduled tick for job {}", job_id)
 
 
 def add_scheduler_job(job: Job) -> None:
@@ -76,7 +72,7 @@ def add_scheduler_job(job: Job) -> None:
         args=[job.id],
         replace_existing=True,
     )
-    logger.info("Scheduled job %s every %ds", job.id, job.interval_seconds)
+    logger.info("Scheduled job {} every {}s", job.id, job.interval_seconds)
 
 
 def remove_scheduler_job(job_id: uuid.UUID) -> None:
@@ -84,23 +80,23 @@ def remove_scheduler_job(job_id: uuid.UUID) -> None:
     sid = str(job_id)
     if scheduler.get_job(sid):
         scheduler.remove_job(sid)
-        logger.info("Removed scheduler job %s", job_id)
+        logger.info("Removed scheduler job {}", job_id)
 
 
 def start_scheduler() -> None:
-    global _loop
-    _loop = asyncio.get_event_loop()
     scheduler = _get_scheduler()
 
-    async def _load_jobs():
-        async with async_session() as session:
-            result = await session.execute(select(Job).where(Job.enabled == True))  # noqa: E712
-            jobs = result.scalars().all()
-            for job in jobs:
-                add_scheduler_job(job)
-            logger.info("Loaded %d jobs into scheduler", len(jobs))
+    db = get_db_instance()
+    session = db.get_session()
+    try:
+        result = session.execute(select(Job).where(Job.enabled == True))  # noqa: E712
+        jobs = result.scalars().all()
+        for job in jobs:
+            add_scheduler_job(job)
+        logger.info("Loaded {} jobs into scheduler", len(jobs))
+    finally:
+        session.close()
 
-    _loop.run_until_complete(_load_jobs())
     scheduler.start()
 
 
