@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
@@ -21,8 +23,9 @@ def _render_prometheus(rows: list[CounterState]) -> str:
             current_metric = state.metric_name
             lines.append(f"# TYPE {state.metric_name} counter")
 
+        labels = json.loads(state.labels) if state.labels else {}
         label_pairs = ",".join(
-            f'{k}="{v}"' for k, v in sorted(state.labels.items())
+            f'{k}="{v}"' for k, v in sorted(labels.items())
         )
         label_str = f"{{{label_pairs}}}" if label_pairs else ""
         value = state.checkpoint + state.last_raw_value

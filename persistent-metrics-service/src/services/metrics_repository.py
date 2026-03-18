@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
 
@@ -11,6 +12,11 @@ from src.core.logging import get_logger
 from src.services.fetcher import Sample
 
 logger = get_logger(__name__)
+
+
+def _canonical_labels(labels: dict) -> str:
+    """Canonical JSON string for deterministic storage and comparison."""
+    return json.dumps(labels, sort_keys=True, separators=(",", ":"))
 
 
 def process_samples(
@@ -25,12 +31,14 @@ def process_samples(
 
     count = 0
     for s in samples:
+        cl = _canonical_labels(s.labels)
+
         stmt = (
             select(CounterState)
             .where(
                 CounterState.job_id == job_id,
                 CounterState.metric_name == s.metric_name,
-                CounterState.labels == s.labels,
+                CounterState.labels == cl,
             )
             .with_for_update()
         )
@@ -41,7 +49,7 @@ def process_samples(
             state = CounterState(
                 job_id=job_id,
                 metric_name=s.metric_name,
-                labels=s.labels,
+                labels=cl,
                 last_raw_value=s.value,
                 checkpoint=0.0,
             )
@@ -60,7 +68,7 @@ def process_samples(
         sample = CounterSample(
             job_id=job_id,
             metric_name=s.metric_name,
-            labels=s.labels,
+            labels=cl,
             accumulated_value=accumulated,
             raw_value=s.value,
             timestamp=s.timestamp,

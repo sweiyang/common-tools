@@ -1,8 +1,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, Index, Integer, String, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.core.db.db import Base
@@ -33,7 +33,7 @@ class CounterState(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
     metric_name: Mapped[str] = mapped_column(String(512), nullable=False)
-    labels: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    labels: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
     last_raw_value: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     checkpoint: Mapped[float] = mapped_column(Float(precision=53), nullable=False, server_default="0.0")
     updated_at: Mapped[datetime] = mapped_column(
@@ -42,7 +42,6 @@ class CounterState(Base):
 
     __table_args__ = (
         UniqueConstraint("job_id", "metric_name", "labels", name="uq_counter_state"),
-        Index("ix_counter_labels_gin", "labels", postgresql_using="gin"),
     )
 
 
@@ -52,7 +51,7 @@ class CounterSample(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
     metric_name: Mapped[str] = mapped_column(String(512), nullable=False)
-    labels: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    labels: Mapped[str] = mapped_column(Text, nullable=False, server_default="{}")
     accumulated_value: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     raw_value: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

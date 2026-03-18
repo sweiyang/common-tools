@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, text, event, inspect, Integer, String, DateTime, Boolean, JSON
+from sqlalchemy import create_engine, text, event, inspect, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 from src.core.config import get_config
@@ -23,8 +23,6 @@ def _get_column_type_sql(column):
         return "TIMESTAMP"
     elif col_type == Boolean or col_type.__name__ == 'Boolean':
         return "BOOLEAN"
-    elif col_type == JSON or col_type.__name__ == 'JSON':
-        return "JSON"
     else:
         return "TEXT"
 
