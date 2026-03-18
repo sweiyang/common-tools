@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from src.api.jobs import router as jobs_router
 from src.api.metrics import router as metrics_router
 from src.core.database import engine, Base
+from src.models import CounterSample, CounterState, Job  # noqa: F401 — register models with Base
 from src.services.scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(level=logging.INFO)

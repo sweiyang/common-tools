@@ -2,10 +2,10 @@
 
 ## Motivation
 
-Today the service only supports polling via the **Prometheus query API** (`/api/v1/query_range`). This requires a running Prometheus instance between the source application and this service:
+Today the service only supports polling via the **Prometheus query API** (`/api/v1/query` instant queries). This requires a running Prometheus instance between the source application and this service:
 
 ```
-Source App /metrics  →  Prometheus  →  This Service (query_range)  →  YugabyteDB
+Source App /metrics  →  Prometheus  →  This Service (instant query)  →  YugabyteDB
 ```
 
 Adding direct `/metrics` scraping removes the Prometheus middleman for use cases where users simply want to persist raw exporter output:
@@ -23,21 +23,19 @@ This is useful when:
 
 ## Current Architecture (for context)
 
-### Job model (`app/models/job.py`)
+### Job model (`src/models/job.py`)
 A job currently stores:
 - `prometheus_url` — base URL of the Prometheus server
 - `query` — a PromQL expression
 - `interval_seconds` — poll frequency
-- `step` — resolution step for `query_range`
-- `last_queried_at` — cursor for incremental fetching
 
-### Fetch path (`app/services/fetcher.py`)
-`fetch_range()` calls `{prometheus_url}/api/v1/query_range` with the PromQL query, parses the JSON response into `Sample` dataclasses (`metric_name`, `labels`, `value`, `timestamp`).
+### Fetch path (`src/services/fetcher.py`)
+`fetch_instant()` calls `{prometheus_url}/api/v1/query` (instant query), parses the JSON response into `Sample` dataclasses (`metric_name`, `labels`, `value`, `timestamp`).
 
-### Insert path (`app/services/metrics_repository.py`)
-`bulk_insert_samples()` does a PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` against the `uq_sample_dedup` constraint on `(job_id, metric_name, labels, timestamp)`.
+### Processing path (`src/services/metrics_repository.py`)
+`process_samples()` performs counter reset detection per series: if the new raw value < previous raw value, the checkpoint is advanced. It updates `counter_states` (one row per series) and appends to `counter_samples` (append-only history with accumulated values).
 
-### Scheduler (`app/services/scheduler.py`)
+### Scheduler (`src/services/scheduler.py`)
 APScheduler `BackgroundScheduler` fires `_job_tick()` → `_execute_job()` on each job's interval. The async coroutine is run in the scheduler thread via `asyncio.run_until_complete()`.
 
 ---
@@ -46,7 +44,7 @@ APScheduler `BackgroundScheduler` fires `_job_tick()` → `_execute_job()` on ea
 
 ### Phase 1: Job Model Changes
 
-**File:** `app/models/job.py`
+**File:** `src/models/job.py`
 
 Add a `source_type` field to distinguish between job modes:
 
@@ -63,7 +61,7 @@ For `metrics_endpoint` jobs:
 
 ### Phase 2: Prometheus Text Exposition Parser
 
-**New file:** `app/services/metrics_parser.py`
+**New file:** `src/services/metrics_parser.py`
 
 Write a parser for the [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-based-format). The parser needs to handle:
 
@@ -84,14 +82,14 @@ class Sample:
 
 Key considerations:
 - If the exposition line includes a timestamp, use it. If not, use "now" (time of scrape).
-- Labels should be sorted by key (consistent with existing `fetch_range` behavior).
+- Labels should be sorted by key (consistent with existing `fetch_instant` behavior).
 - Consider using an existing library like [`prometheus_client.parser`](https://github.com/prometheus/client_python) which provides `text_string_to_metric_families()` — this avoids writing a parser from scratch and handles edge cases (escaped quotes in labels, multi-line help strings, etc.).
 
 ### Phase 3: Direct Scrape Fetcher
 
-**File:** `app/services/fetcher.py`
+**File:** `src/services/fetcher.py`
 
-Add a new async function alongside the existing `fetch_range()`:
+Add a new async function alongside the existing `fetch_instant()`:
 
 ```python
 async def fetch_metrics_endpoint(
@@ -109,13 +107,13 @@ async def fetch_metrics_endpoint(
 The function:
 1. GETs the target URL
 2. Passes the response body to the text exposition parser
-3. Returns the same `list[Sample]` that `fetch_range` returns
+3. Returns the same `list[Sample]` that `fetch_instant` returns
 
-Because both functions return `list[Sample]`, the downstream insert path (`bulk_insert_samples`) needs **zero changes**.
+Because both functions return `list[Sample]`, the downstream processing path (`process_samples`) needs **zero changes**.
 
 ### Phase 4: Scheduler Dispatch
 
-**File:** `app/services/scheduler.py`
+**File:** `src/services/scheduler.py`
 
 Update `_execute_job()` to branch on `job.source_type`:
 
@@ -131,30 +129,25 @@ async def _execute_job(job_id: uuid.UUID) -> None:
         try:
             if job.source_type == "metrics_endpoint":
                 samples = await fetch_metrics_endpoint(
-                    target_url=job.prometheus_url,  # or job.target_url
+                    target_url=job.prometheus_url,
                 )
             else:
-                start = job.last_queried_at or (now - timedelta(seconds=job.interval_seconds))
-                samples = await fetch_range(
+                samples = await fetch_instant(
                     prometheus_url=job.prometheus_url,
                     query=job.query,
-                    start=start,
-                    end=now,
-                    step=job.step,
                 )
         except Exception:
             logger.exception("Fetch failed for job %s", job_id)
             return
 
-        await bulk_insert_samples(session, job_id, samples, fetched_at=now)
-        await update_last_queried_at(session, job_id, queried_at=now)
+        await process_samples(session, job_id, samples, fetched_at=now)
 ```
 
-**Important:** For `metrics_endpoint` jobs, `last_queried_at` is still updated (useful for observability — "when did we last successfully scrape?") but is not used for incremental fetching since each scrape returns the current state of the target.
+**Important:** For `metrics_endpoint` jobs, the same `process_samples()` path handles reset detection and accumulation. Both job types share the same downstream processing.
 
 ### Phase 5: Schema / API Changes
 
-**File:** `app/schemas/job.py`
+**File:** `src/schemas/job.py`
 
 Update `JobCreate` and `JobResponse`:
 
@@ -165,18 +158,17 @@ class JobCreate(BaseModel):
     prometheus_url: str  # acts as target_url for metrics_endpoint jobs
     query: str | None = Field(default=None)  # required only for prometheus_api
     interval_seconds: int = Field(..., gt=0)
-    step: str = Field(default="15s")
 ```
 
 Add validation: if `source_type == "prometheus_api"`, then `query` is required. This can be done with a Pydantic `model_validator`.
 
-**File:** `app/api/jobs.py`
+**File:** `src/api/jobs.py`
 
 No structural changes needed — the existing CRUD endpoints work as-is since they pass through all fields.
 
 ### Phase 6: Dedup Behavior for Direct Scraping
 
-The existing dedup constraint is `(job_id, metric_name, labels, timestamp)`. For `metrics_endpoint` jobs this means:
+The existing dedup constraint on `counter_samples` is `(job_id, metric_name, labels, timestamp)`. For `metrics_endpoint` jobs this means:
 
 - If the target's `/metrics` does **not** include timestamps (common for gauges/counters), the parser assigns "now" as the timestamp. Each scrape gets a different timestamp → **no dedup collisions** → every scrape inserts new rows. This is the correct behavior — it captures the metric value at each point in time.
 
@@ -190,14 +182,14 @@ No changes needed to the dedup logic.
 
 | File | Change |
 |------|--------|
-| `app/models/job.py` | Add `source_type` column |
-| `app/schemas/job.py` | Add `source_type` field, make `query` optional with validation |
-| `app/services/metrics_parser.py` | **New** — Prometheus text format parser (or wrap `prometheus_client.parser`) |
-| `app/services/fetcher.py` | Add `fetch_metrics_endpoint()` function |
-| `app/services/scheduler.py` | Branch `_execute_job()` on `source_type` |
-| `app/api/jobs.py` | No changes (pass-through) |
-| `app/api/metrics.py` | No changes (reads from same `metric_samples` table) |
-| `app/services/metrics_repository.py` | No changes (same `Sample` → same insert) |
+| `src/models/job.py` | Add `source_type` column |
+| `src/schemas/job.py` | Add `source_type` field, make `query` optional with validation |
+| `src/services/metrics_parser.py` | **New** — Prometheus text format parser (or wrap `prometheus_client.parser`) |
+| `src/services/fetcher.py` | Add `fetch_metrics_endpoint()` function |
+| `src/services/scheduler.py` | Branch `_execute_job()` on `source_type` |
+| `src/api/jobs.py` | No changes (pass-through) |
+| `src/api/metrics.py` | No changes (reads from `counter_states` table) |
+| `src/services/metrics_repository.py` | No changes (same `Sample` → same `process_samples` path) |
 | `requirements.txt` | Potentially add `prometheus_client` if using its parser |
 
 ---

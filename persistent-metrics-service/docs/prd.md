@@ -6,17 +6,18 @@ Prometheus metrics are ephemeral. When a target restarts, its counters reset. Wh
 
 ## Solution
 
-A FastAPI service that acts as a **persistent metrics relay**:
+A FastAPI service that acts as a **persistent counter metrics relay** with reset detection:
 
 1. Users register **jobs** via API — each job points at a source Prometheus server, a PromQL query, and a scrape interval.
-2. A background scheduler periodically calls the source Prometheus `/api/v1/query_range` API to fetch samples since the last query.
-3. Samples are stored in **YugabyteDB** (PostgreSQL-compatible distributed SQL).
-4. The service exposes a **`GET /metrics`** endpoint that renders the latest value per (metric_name, labels) in Prometheus text exposition format.
-5. An external Prometheus can scrape this `/metrics` endpoint and see durable, persistent metrics.
+2. A background scheduler periodically runs instant queries against the source Prometheus (`/api/v1/query`), detects counter resets, and accumulates durable counter values.
+3. Counter states and samples are stored in **YugabyteDB** (PostgreSQL-compatible distributed SQL).
+4. The service exposes a **`GET /metrics`** endpoint that renders the accumulated value per (metric_name, labels) in Prometheus text exposition format (type `counter`).
+5. An external Prometheus can scrape this `/metrics` endpoint and see durable, persistent counter metrics that survive source restarts.
 
 ## Key decisions
 
-- **Source**: Prometheus HTTP query API (`query_range`), not raw exporter endpoints.
+- **Counter-only focus**: The service is designed specifically for counter metrics with built-in reset detection. When a source application restarts and its counters reset, the service detects the drop and continues accumulating seamlessly.
+- **Source**: Prometheus HTTP query API (instant query), not raw exporter endpoints.
 - **Storage**: YugabyteDB (YSQL) — chosen for distributed SQL durability and PostgreSQL compatibility.
 - **Auth**: API-key based (`X-API-Key` header) on job management endpoints; `/metrics` is unauthenticated for Prometheus scraping.
 - **Config**: `config.yaml` file (database URL, API key, server settings).

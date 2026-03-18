@@ -53,9 +53,8 @@ A job tells the service what to scrape from Prometheus. Here's the anatomy of a 
 |-------|----------|-------------|
 | `name` | No | Human-readable name for the job |
 | `prometheus_url` | Yes | Base URL of the Prometheus server |
-| `query` | Yes | PromQL expression to fetch |
+| `query` | Yes | PromQL expression to fetch (should return counter metrics) |
 | `interval_seconds` | Yes | How often to fetch (in seconds) |
-| `step` | No | Resolution step for query_range (default: "15s") |
 
 ### Example: Scrape HTTP request metrics
 
@@ -79,9 +78,7 @@ Response:
   "prometheus_url": "http://localhost:9090",
   "query": "example_http_requests_total",
   "interval_seconds": 60,
-  "step": "15s",
   "enabled": true,
-  "last_queried_at": null,
   "created_at": "2024-01-15T10:30:00Z",
   "updated_at": "2024-01-15T10:30:00Z"
 }
@@ -89,34 +86,25 @@ Response:
 
 The job is now active. The service will:
 1. Immediately schedule the job
-2. Every 60 seconds, query Prometheus for new samples since `last_queried_at`
-3. Store samples in YugabyteDB
+2. Every 60 seconds, run an instant query against Prometheus, detect counter resets, and accumulate values
+3. Store counter states and samples in YugabyteDB
 
 ## Step 4: Register More Jobs
 
-### Scrape multiple metrics with different queries
+### Scrape multiple counter metrics
+
+> **Note:** This service is designed for **counter metrics only**. It uses reset detection and accumulation to produce durable counter values. Gauges and histograms are not supported.
 
 ```bash
-# Active connections
+# HTTP request counters
 curl -X POST http://localhost:8000/jobs/ \
   -H "Content-Type: application/json" \
   -H "X-API-Key: change-me-to-a-real-secret" \
   -d '{
-    "name": "Active connections",
+    "name": "HTTP requests",
     "prometheus_url": "http://localhost:9090",
-    "query": "example_active_connections",
+    "query": "example_http_requests_total",
     "interval_seconds": 30
-  }'
-
-# Request latency histogram
-curl -X POST http://localhost:8000/jobs/ \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: change-me-to-a-real-secret" \
-  -d '{
-    "name": "Request latency",
-    "prometheus_url": "http://localhost:9090",
-    "query": "example_request_latency_seconds_bucket",
-    "interval_seconds": 60
   }'
 
 # Orders by region (using PromQL aggregation)
@@ -159,11 +147,11 @@ curl http://localhost:8000/metrics
 
 Output (Prometheus text format):
 ```
-# TYPE example_http_requests_total gauge
+# TYPE example_http_requests_total counter
 example_http_requests_total{endpoint="/api/users",method="GET",status="200"} 1523 1705312200000
 example_http_requests_total{endpoint="/api/orders",method="POST",status="201"} 342 1705312200000
-# TYPE example_active_connections gauge
-example_active_connections{} 47 1705312200000
+# TYPE example_orders_processed_total counter
+example_orders_processed_total{product="widgets",region="us-east"} 890 1705312200000
 ```
 
 ### Point external Prometheus at this endpoint
@@ -231,7 +219,7 @@ curl -X DELETE http://localhost:8000/jobs/{job_id} \
   -H "X-API-Key: change-me-to-a-real-secret"
 ```
 
-Note: Deleting a job removes it from the scheduler but **keeps historical samples** in the database.
+Note: Deleting a job removes it from the scheduler but **keeps historical data** in `counter_samples` and `counter_states` in the database.
 
 ## Common Patterns
 
@@ -277,22 +265,9 @@ curl -X POST http://localhost:8000/jobs/ \
   }'
 ```
 
-### Pattern 3: High-resolution for short periods
+### Counter Reset Behavior
 
-Use a smaller step for finer granularity:
-
-```bash
-curl -X POST http://localhost:8000/jobs/ \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: change-me-to-a-real-secret" \
-  -d '{
-    "name": "High-res latency",
-    "prometheus_url": "http://localhost:9090",
-    "query": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[1m]))",
-    "interval_seconds": 15,
-    "step": "5s"
-  }'
-```
+This service automatically handles counter resets. When a source application restarts and its counters reset to zero, the service detects the drop in raw value and advances an internal checkpoint. The accumulated value exposed via `/metrics` continues increasing seamlessly — no manual intervention required.
 
 ## Troubleshooting
 
@@ -319,7 +294,7 @@ curl -X POST http://localhost:8000/jobs/ \
 ### No metrics on /metrics endpoint
 
 1. Wait for at least one job interval to pass
-2. Verify jobs have `last_queried_at` set (not null)
+2. Verify the job is enabled and check service logs for fetch/reset-detection activity
 3. Check that the query returns data in Prometheus directly
 
 ### Authentication errors

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Service Does
 
-A FastAPI relay that makes Prometheus metrics durable. It polls Prometheus on a schedule (via registered "jobs"), persists samples in YugabyteDB, and re-exposes them at `GET /metrics` for external Prometheus scraping. Metrics survive restarts of the original source systems.
+A FastAPI relay that makes Prometheus counter metrics durable. It polls Prometheus on a schedule (via registered "jobs"), detects counter resets, accumulates values, persists them in YugabyteDB, and re-exposes them at `GET /metrics` for external Prometheus scraping. Counter values survive restarts of both the original source systems and this service.
 
 ## Commands
 
@@ -36,12 +36,13 @@ Source App → Prometheus → [this service polls via jobs] → YugabyteDB → G
 **Request flow for metric collection:**
 1. User registers a job (`POST /jobs`) with a Prometheus URL, PromQL query, and interval
 2. `scheduler.py` (APScheduler `BackgroundScheduler` in a thread) fires the job on its interval
-3. `fetcher.py` calls Prometheus `/api/v1/query_range` from `last_queried_at` to now
-4. `metrics_repository.py` bulk-inserts samples with `ON CONFLICT DO NOTHING` dedup
-5. `GET /metrics` uses `DISTINCT ON (metric_name, labels)` to return the latest value per label set in Prometheus text format
+3. `fetcher.py` runs an instant query (`/api/v1/query`) against Prometheus
+4. `metrics_repository.py` (`process_samples`) detects counter resets, updates `counter_states`, and appends a `counter_samples` row with the accumulated value
+5. `GET /metrics` reads `counter_states` and returns `checkpoint + last_raw_value` per series in Prometheus text format (type `counter`)
 
 **Key design points:**
-- `last_queried_at` on the Job model enables incremental fetching — only new samples are fetched each run
+- Counter reset detection: if the new raw value < the previous raw value, the checkpoint is advanced by the previous raw value, and accumulation continues seamlessly
+- `counter_states` stores one row per (job, metric_name, labels) with `last_raw_value` and `checkpoint`; `counter_samples` is the append-only history
 - Labels are stored as JSONB with a GIN index for flexible querying
 - The scheduler bridges sync APScheduler → async coroutines via `asyncio.run()` in `_run_async()`
 - `/metrics` is unauthenticated; all `/jobs/*` endpoints require `X-API-Key` header

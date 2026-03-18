@@ -1,6 +1,6 @@
 # Persistent Metrics Service
 
-A FastAPI service that queries Prometheus servers on a schedule, persists metric samples in YugabyteDB, and re-exposes them via a `/metrics` endpoint for durable Prometheus scraping.
+A FastAPI service that queries Prometheus servers on a schedule, detects counter resets, accumulates durable counter values in YugabyteDB, and re-exposes them via a `/metrics` endpoint for persistent Prometheus scraping.
 
 ## Quick start
 
@@ -70,8 +70,7 @@ curl -X POST http://localhost:8000/jobs/ \
     "name": "cpu metrics",
     "prometheus_url": "http://prometheus:9090",
     "query": "node_cpu_seconds_total",
-    "interval_seconds": 300,
-    "step": "15s"
+    "interval_seconds": 300
   }'
 ```
 
@@ -109,13 +108,12 @@ You can override the config file path with the `CONFIG_PATH` environment variabl
 
 ## Example App
 
-The `example-app/` directory contains a sample Python application that generates realistic Prometheus metrics:
+The `example-app/` directory contains a sample Python application that generates realistic Prometheus metrics. This service is designed for **counter metrics only**. Relevant example-app counters:
 
 - `example_http_requests_total` — Counter with method, endpoint, status labels
-- `example_active_connections` — Gauge that fluctuates over time
-- `example_request_latency_seconds` — Histogram of request latencies
 - `example_orders_processed_total` — Counter with region and product labels
-- `example_queue_size` — Gauge per queue name
+
+The example app also exports gauges and histograms (`example_active_connections`, `example_request_latency_seconds`, `example_queue_size`), but this service only tracks counters with reset detection.
 
 Run it standalone:
 ```bash

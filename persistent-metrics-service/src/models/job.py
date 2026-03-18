@@ -18,11 +18,7 @@ class Job(Base):
     prometheus_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False)
     interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
-    step: Mapped[str] = mapped_column(String(32), nullable=False, default="15s")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    last_queried_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

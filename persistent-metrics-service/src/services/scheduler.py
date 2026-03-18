@@ -3,15 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 
 from src.core.database import async_session
 from src.models.job import Job
-from src.services.fetcher import fetch_range
-from src.services.metrics_repository import bulk_insert_samples, update_last_queried_at
+from src.services.fetcher import fetch_instant
+from src.services.metrics_repository import process_samples
 
 logger = logging.getLogger(__name__)
 
@@ -40,22 +40,17 @@ async def _execute_job(job_id: uuid.UUID) -> None:
             return
 
         now = datetime.now(timezone.utc)
-        start = job.last_queried_at or (now - timedelta(seconds=job.interval_seconds))
 
         try:
-            samples = await fetch_range(
+            samples = await fetch_instant(
                 prometheus_url=job.prometheus_url,
                 query=job.query,
-                start=start,
-                end=now,
-                step=job.step,
             )
         except Exception:
             logger.exception("Fetch failed for job %s", job_id)
             return
 
-        await bulk_insert_samples(session, job_id, samples, fetched_at=now)
-        await update_last_queried_at(session, job_id, queried_at=now)
+        await process_samples(session, job_id, samples, fetched_at=now)
 
 
 def _job_tick(job_id: uuid.UUID) -> None:

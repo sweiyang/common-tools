@@ -17,22 +17,14 @@ class Sample:
     timestamp: datetime
 
 
-async def fetch_range(
+async def fetch_instant(
     prometheus_url: str,
     query: str,
-    start: datetime,
-    end: datetime,
-    step: str = "15s",
     timeout: float = 30.0,
 ) -> list[Sample]:
-    """Call Prometheus /api/v1/query_range and return parsed samples."""
-    url = f"{prometheus_url.rstrip('/')}/api/v1/query_range"
-    params = {
-        "query": query,
-        "start": start.timestamp(),
-        "end": end.timestamp(),
-        "step": step,
-    }
+    """Call Prometheus /api/v1/query (instant) and return parsed samples."""
+    url = f"{prometheus_url.rstrip('/')}/api/v1/query"
+    params = {"query": query}
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.get(url, params=params)
@@ -47,18 +39,20 @@ async def fetch_range(
     for result in body.get("data", {}).get("result", []):
         metric = result.get("metric", {})
         metric_name = metric.pop("__name__", "unknown")
-        labels = metric  # remaining keys are labels
+        labels = dict(sorted(metric.items()))
 
-        for ts_val in result.get("values", []):
-            ts_epoch, val_str = ts_val
-            samples.append(
-                Sample(
-                    metric_name=metric_name,
-                    labels=dict(sorted(labels.items())),
-                    value=float(val_str),
-                    timestamp=datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc),
-                )
+        value_pair = result.get("value")
+        if value_pair is None:
+            continue
+        ts_epoch, val_str = value_pair
+        samples.append(
+            Sample(
+                metric_name=metric_name,
+                labels=labels,
+                value=float(val_str),
+                timestamp=datetime.fromtimestamp(float(ts_epoch), tz=timezone.utc),
             )
+        )
 
     logger.info("Fetched %d samples for query=%s", len(samples), query)
     return samples
