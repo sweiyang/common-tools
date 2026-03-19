@@ -7,3 +7,4 @@ httpx
 pyyaml
 pydantic
 loguru
+prometheus-client

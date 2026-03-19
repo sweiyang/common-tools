@@ -18,6 +18,9 @@ class Job(Base):
     prometheus_url: Mapped[str] = mapped_column(String(2048), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False)
     interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    offset_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cron_expression: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, default="prometheus")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
