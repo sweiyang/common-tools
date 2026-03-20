@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class JobCreate(BaseModel):
     name: str | None = None
+    application_name: str | None = None
     url: str = Field(..., examples=["http://prometheus:9090"])
     query: str | None = Field(default=None, examples=["example_http_requests_total"])
     interval_seconds: int | None = Field(default=None, gt=0, examples=[300])
@@ -50,6 +51,7 @@ class JobCreate(BaseModel):
 
 class JobUpdate(BaseModel):
     name: str | None = None
+    application_name: str | None = None
     url: str | None = None
     query: str | None = None
     interval_seconds: int | None = Field(default=None, gt=0)
@@ -62,6 +64,7 @@ class JobUpdate(BaseModel):
 class JobResponse(BaseModel):
     id: uuid.UUID
     name: str | None
+    application_name: str | None
     url: str
     query: str
     interval_seconds: int
@@ -75,8 +78,20 @@ class JobResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BaseValueEntry(BaseModel):
+    metric_name: str
+    labels: dict = {}
+    base_value: float
+
+
+class BaseValueResponse(BaseModel):
+    updated: int
+    not_found: list[dict]
+
+
 class JobTestResult(BaseModel):
     samples_fetched: int
     samples: list[dict]
     counter_states: list[dict]
+    conflicts: list[dict] = []
     errors: list[str]

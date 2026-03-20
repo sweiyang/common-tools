@@ -15,6 +15,7 @@ class Job(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    application_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False)
     interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -40,6 +41,7 @@ class CounterState(Base):
     current_value: Mapped[float] = mapped_column(Float(precision=53), nullable=False)
     checkpoint: Mapped[float] = mapped_column(Float(precision=53), nullable=False, server_default="0.0")
     count: Mapped[float] = mapped_column(Float(precision=53), nullable=False, server_default="0.0")
+    base_value: Mapped[float] = mapped_column(Float(precision=53), nullable=False, server_default="0.0")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

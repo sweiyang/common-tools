@@ -28,7 +28,7 @@ def _render_prometheus(rows: list[CounterState]) -> str:
             f'{k}="{v}"' for k, v in sorted(labels.items())
         )
         label_str = f"{{{label_pairs}}}" if label_pairs else ""
-        value = state.count
+        value = state.base_value + state.count
         ts_ms = int(state.updated_at.timestamp() * 1000)
         lines.append(f"{state.metric_name}{label_str} {value} {ts_ms}")
 
