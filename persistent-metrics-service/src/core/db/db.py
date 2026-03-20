@@ -6,6 +6,11 @@ from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+COLUMN_RENAMES = {
+    "counter_states": {"last_raw_value": "current_value"},
+    "jobs": {"prometheus_url": "url"},
+}
+
 
 class Base(DeclarativeBase):
     pass
@@ -109,6 +114,20 @@ class Database:
             existing_columns = {col['name'] for col in inspector.get_columns(table.name, schema=self.schema)}
             model_columns = {col.name: col for col in table.columns}
 
+            # Rename columns if needed (idempotent: skips if old name doesn't exist)
+            renames = COLUMN_RENAMES.get(table.name, {})
+            if renames:
+                with self.engine.connect() as conn:
+                    for old_name, new_name in renames.items():
+                        if old_name in existing_columns and new_name not in existing_columns:
+                            qualified_table = f'"{self.schema}"."{table.name}"' if self.schema else f'"{table.name}"'
+                            sql = f'ALTER TABLE {qualified_table} RENAME COLUMN "{old_name}" TO "{new_name}"'
+                            logger.info("Renaming column: {}", sql)
+                            conn.execute(text(sql))
+                    conn.commit()
+                # Refresh existing columns after renames
+                existing_columns = {col['name'] for col in inspector.get_columns(table.name, schema=self.schema)}
+
             missing_columns = set(model_columns.keys()) - existing_columns
 
             if missing_columns:
@@ -140,6 +159,15 @@ class Database:
                     logger.info("Added {} column(s) to '{}'", len(missing_columns), table.name)
 
         Base.metadata.create_all(self.engine)
+
+        # Backfill count column for existing rows
+        qualified_cs = f'"{self.schema}"."counter_states"' if self.schema else '"counter_states"'
+        with self.engine.connect() as conn:
+            conn.execute(text(
+                f"UPDATE {qualified_cs} SET count = current_value + checkpoint WHERE count = 0"
+            ))
+            conn.commit()
+
         logger.info("Schema synchronization complete")
 
     def get_session(self):

@@ -29,7 +29,7 @@ def process_samples(
     if not samples:
         return 0
 
-    count = 0
+    processed = 0
     for s in samples:
         cl = _canonical_labels(s.labels)
 
@@ -50,33 +50,33 @@ def process_samples(
                 job_id=job_id,
                 metric_name=s.metric_name,
                 labels=cl,
-                last_raw_value=s.value,
+                current_value=s.value,
                 checkpoint=0.0,
+                count=s.value,
             )
             session.add(state)
         else:
-            if s.value < state.last_raw_value:
-                state.checkpoint += state.last_raw_value
+            if s.value < state.current_value:
+                state.checkpoint = state.count
                 logger.info(
                     "Counter reset detected for {} {}: checkpoint now {:.2f}",
                     s.metric_name, s.labels, state.checkpoint,
                 )
-            state.last_raw_value = s.value
-
-        accumulated = state.checkpoint + s.value
+            state.current_value = s.value
+            state.count = state.checkpoint + state.current_value
 
         sample = CounterSample(
             job_id=job_id,
             metric_name=s.metric_name,
             labels=cl,
-            accumulated_value=accumulated,
+            accumulated_value=state.count,
             raw_value=s.value,
             timestamp=s.timestamp,
             fetched_at=fetched_at,
         )
         session.add(sample)
-        count += 1
+        processed += 1
 
     session.commit()
-    logger.info("Processed {} samples for job {}", count, job_id)
-    return count
+    logger.info("Processed {} samples for job {}", processed, job_id)
+    return processed

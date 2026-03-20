@@ -26,7 +26,7 @@ def _get_scheduler() -> BackgroundScheduler:
 
 
 def fetch_job_samples(
-    prometheus_url: str,
+    url: str,
     query: str | None,
     source_type: str,
     offset_seconds: int = 0,
@@ -34,14 +34,14 @@ def fetch_job_samples(
     """Fetch samples based on job configuration. Reusable by scheduler and test endpoint."""
     if source_type == "metrics_endpoint":
         metric_filter = query if query else None
-        return fetch_metrics_endpoint(target_url=prometheus_url, metric_filter=metric_filter)
+        return fetch_metrics_endpoint(target_url=url, metric_filter=metric_filter)
     else:
         # source_type == "prometheus"
         query_time = None
         if offset_seconds > 0:
             query_time = datetime.now(timezone.utc).timestamp() - offset_seconds
         return fetch_instant(
-            prometheus_url=prometheus_url,
+            url=url,
             query=query or "",
             query_time=query_time,
         )
@@ -60,7 +60,7 @@ def _execute_job(job_id: uuid.UUID) -> None:
 
         try:
             samples = fetch_job_samples(
-                prometheus_url=job.prometheus_url,
+                url=job.url,
                 query=job.query,
                 source_type=job.source_type,
                 offset_seconds=job.offset_seconds,

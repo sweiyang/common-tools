@@ -20,19 +20,19 @@ class Sample:
 
 
 def fetch_instant(
-    prometheus_url: str,
+    url: str,
     query: str,
     timeout: float = 30.0,
     query_time: float | None = None,
 ) -> list[Sample]:
     """Call Prometheus /api/v1/query (instant) and return parsed samples."""
-    url = f"{prometheus_url.rstrip('/')}/api/v1/query"
+    endpoint = f"{url.rstrip('/')}/api/v1/query"
     params: dict = {"query": query}
     if query_time is not None:
         params["time"] = query_time
 
     with httpx.Client(timeout=timeout) as client:
-        resp = client.get(url, params=params)
+        resp = client.get(endpoint, params=params)
         resp.raise_for_status()
 
     body = resp.json()

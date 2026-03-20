@@ -124,7 +124,7 @@ async def test_job(body: JobCreate):
 
     try:
         samples = fetch_job_samples(
-            prometheus_url=body.prometheus_url,
+            url=body.url,
             query=body.query,
             source_type=body.source_type,
             offset_seconds=body.offset_seconds,
@@ -153,16 +153,16 @@ async def test_job(body: JobCreate):
             state_map[key] = {
                 "metric_name": s.metric_name,
                 "labels": s.labels,
-                "last_raw_value": s.value,
+                "current_value": s.value,
                 "checkpoint": 0.0,
-                "accumulated_value": s.value,
+                "count": s.value,
             }
         else:
             state = state_map[key]
-            if s.value < state["last_raw_value"]:
-                state["checkpoint"] += state["last_raw_value"]
-            state["last_raw_value"] = s.value
-            state["accumulated_value"] = state["checkpoint"] + s.value
+            if s.value < state["current_value"]:
+                state["checkpoint"] = state["count"]
+            state["current_value"] = s.value
+            state["count"] = state["checkpoint"] + s.value
 
     counter_states = list(state_map.values())
 
