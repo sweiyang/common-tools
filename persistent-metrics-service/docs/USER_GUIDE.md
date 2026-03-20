@@ -219,7 +219,7 @@ curl -X DELETE http://localhost:8000/jobs/{job_id} \
   -H "X-API-Key: change-me-to-a-real-secret"
 ```
 
-Note: Deleting a job removes it from the scheduler but **keeps historical data** in `counter_samples` and `counter_states` in the database.
+Note: Deleting a job removes it from the scheduler but **keeps historical data** in `counter_states` in the database.
 
 ## Common Patterns
 

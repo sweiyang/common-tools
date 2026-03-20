@@ -33,7 +33,7 @@ A job currently stores:
 `fetch_instant()` calls `{prometheus_url}/api/v1/query` (instant query), parses the JSON response into `Sample` dataclasses (`metric_name`, `labels`, `value`, `timestamp`).
 
 ### Processing path (`src/services/metrics_repository.py`)
-`process_samples()` performs counter reset detection per series: if the new raw value < previous raw value, the checkpoint is advanced. It updates `counter_states` (one row per series) and appends to `counter_samples` (append-only history with accumulated values).
+`process_samples()` performs counter reset detection per series: if the new raw value < previous raw value, the checkpoint is advanced. It updates `counter_states` (one row per series).
 
 ### Scheduler (`src/services/scheduler.py`)
 APScheduler `BackgroundScheduler` fires `_job_tick()` → `_execute_job()` on each job's interval. The async coroutine is run in the scheduler thread via `asyncio.run_until_complete()`.
@@ -165,16 +165,6 @@ Add validation: if `source_type == "prometheus_api"`, then `query` is required. 
 **File:** `src/api/jobs.py`
 
 No structural changes needed — the existing CRUD endpoints work as-is since they pass through all fields.
-
-### Phase 6: Dedup Behavior for Direct Scraping
-
-The existing dedup constraint on `counter_samples` is `(job_id, metric_name, labels, timestamp)`. For `metrics_endpoint` jobs this means:
-
-- If the target's `/metrics` does **not** include timestamps (common for gauges/counters), the parser assigns "now" as the timestamp. Each scrape gets a different timestamp → **no dedup collisions** → every scrape inserts new rows. This is the correct behavior — it captures the metric value at each point in time.
-
-- If the target **does** include timestamps and the value hasn't changed, the same `(job_id, metric_name, labels, timestamp)` tuple is seen again → `ON CONFLICT DO NOTHING` kicks in → no duplicates. Also correct.
-
-No changes needed to the dedup logic.
 
 ---
 

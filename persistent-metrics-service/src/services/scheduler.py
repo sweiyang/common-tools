@@ -56,8 +56,6 @@ def _execute_job(job_id: uuid.UUID) -> None:
             logger.warning("Job {} not found or disabled, skipping", job_id)
             return
 
-        now = datetime.now(timezone.utc)
-
         try:
             samples = fetch_job_samples(
                 url=job.url,
@@ -69,7 +67,7 @@ def _execute_job(job_id: uuid.UUID) -> None:
             logger.exception("Fetch failed for job {}", job_id)
             return
 
-        process_samples(session, job_id, samples, fetched_at=now)
+        process_samples(session, job_id, samples)
     finally:
         session.close()
 

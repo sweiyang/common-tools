@@ -11,6 +11,8 @@ COLUMN_RENAMES = {
     "jobs": {"prometheus_url": "url"},
 }
 
+DROP_TABLES = ["counter_samples"]
+
 
 class Base(DeclarativeBase):
     pass
@@ -105,6 +107,15 @@ class Database:
 
         inspector = inspect(self.engine)
         existing_tables = inspector.get_table_names(schema=self.schema)
+
+        # Drop obsolete tables
+        for table_name in DROP_TABLES:
+            if table_name in existing_tables:
+                qualified = f'"{self.schema}"."{table_name}"' if self.schema else f'"{table_name}"'
+                logger.info("Dropping obsolete table '{}'", table_name)
+                with self.engine.connect() as conn:
+                    conn.execute(text(f"DROP TABLE IF EXISTS {qualified}"))
+                    conn.commit()
 
         for _table_key, table in Base.metadata.tables.items():
             if table.name not in existing_tables:
