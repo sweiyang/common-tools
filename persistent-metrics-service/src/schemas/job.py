@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 class JobCreate(BaseModel):
     name: str | None = None
-    application_name: str | None = None
+    application_name: str
     url: str = Field(..., examples=["http://prometheus:9090"])
     query: str | None = Field(default=None, examples=["example_http_requests_total"])
     interval_seconds: int | None = Field(default=None, gt=0, examples=[300])
@@ -64,7 +64,7 @@ class JobUpdate(BaseModel):
 class JobResponse(BaseModel):
     id: uuid.UUID
     name: str | None
-    application_name: str | None
+    application_name: str
     url: str
     query: str
     interval_seconds: int

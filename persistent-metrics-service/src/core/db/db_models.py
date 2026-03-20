@@ -15,7 +15,7 @@ class Job(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    application_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    application_name: Mapped[str] = mapped_column(String(255), nullable=False)
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     query: Mapped[str] = mapped_column(String(4096), nullable=False)
     interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False)

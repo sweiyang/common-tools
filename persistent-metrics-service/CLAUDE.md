@@ -49,7 +49,7 @@ Source App → Prometheus → [this service polls via jobs] → YugabyteDB → G
 - `/metrics` is unauthenticated; all `/jobs/*` endpoints require `X-API-Key` header
 - DB tables are created on startup via `db.sync_schema()` + `db.create_tables()`
 - Logging uses loguru via `src/core/logging.py` (`setup_logging()` / `get_logger()`)
-- Jobs have an optional `application_name` field for logical grouping
+- Jobs have a required `application_name` field. Metric names in `/metrics` output are prefixed with the job's `application_name` (e.g., `myapp_http_requests_total`)
 - `base_value` on `counter_states` provides an initial offset for historical/migrated data. The exposed metric value is `base_value + count` (where count = checkpoint + current_value). Set via `PATCH /jobs/{job_id}/base-values` (requires the counter_state row to already exist from at least one job run).
 - **Metric conflict detection** (`src/services/conflict_checker.py`): on job creation/update, the service fetches samples and checks if any `(metric_name, labels)` pairs already exist in `counter_states` under a different job. If conflicts are found, `POST /jobs` and `PATCH /jobs/{id}` return 409. `POST /jobs/test` reports conflicts without blocking.
 
