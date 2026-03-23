@@ -1,59 +1,70 @@
 from __future__ import annotations
 
-import logging
-from datetime import datetime
+import json
+import uuid
 
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
-from src.models.metric_sample import MetricSample
+from src.core.db.db_models import CounterState
+from src.core.logging import get_logger
+from src.services.fetcher import Sample
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
-async def bulk_insert_samples(
-    session: AsyncSession,
-    job_id,
-    samples: list,
-    fetched_at: datetime,
+def _canonical_labels(labels: dict) -> str:
+    """Canonical JSON string for deterministic storage and comparison."""
+    return json.dumps(labels, sort_keys=True, separators=(",", ":"))
+
+
+def process_samples(
+    session: Session,
+    job_id: uuid.UUID,
+    samples: list[Sample],
 ) -> int:
-    """Insert samples with ON CONFLICT DO NOTHING dedup. Returns rows inserted."""
+    """Process samples with counter reset detection. Returns number of samples processed."""
     if not samples:
         return 0
 
-    rows = [
-        {
-            "job_id": job_id,
-            "metric_name": s.metric_name,
-            "labels": s.labels,
-            "value": s.value,
-            "timestamp": s.timestamp,
-            "fetched_at": fetched_at,
-        }
-        for s in samples
-    ]
+    processed = 0
+    for s in samples:
+        cl = _canonical_labels(s.labels)
 
-    stmt = (
-        pg_insert(MetricSample)
-        .values(rows)
-        .on_conflict_do_nothing(constraint="uq_sample_dedup")
-    )
-    result = await session.execute(stmt)
-    await session.commit()
+        stmt = (
+            select(CounterState)
+            .where(
+                CounterState.job_id == job_id,
+                CounterState.metric_name == s.metric_name,
+                CounterState.labels == cl,
+            )
+            .with_for_update()
+        )
+        result = session.execute(stmt)
+        state = result.scalar_one_or_none()
 
-    inserted = result.rowcount  # type: ignore[union-attr]
-    logger.info("Inserted %d / %d samples for job %s", inserted, len(rows), job_id)
-    return inserted
+        if state is None:
+            state = CounterState(
+                job_id=job_id,
+                metric_name=s.metric_name,
+                labels=cl,
+                current_value=s.value,
+                checkpoint=0.0,
+                count=s.value,
+            )
+            session.add(state)
+        else:
+            if s.value < state.current_value:
+                state.checkpoint = state.count
+                logger.info(
+                    "Counter reset detected for {} {}: checkpoint now {:.2f}",
+                    s.metric_name, s.labels, state.checkpoint,
+                )
+            state.current_value = s.value
+            state.count = state.checkpoint + state.current_value
 
+        processed += 1
 
-async def update_last_queried_at(
-    session: AsyncSession,
-    job_id,
-    queried_at: datetime,
-) -> None:
-    await session.execute(
-        text("UPDATE jobs SET last_queried_at = :ts, updated_at = now() WHERE id = :jid"),
-        {"ts": queried_at, "jid": str(job_id)},
-    )
-    await session.commit()
+    session.commit()
+    logger.info("Processed {} samples for job {}", processed, job_id)
+    return processed

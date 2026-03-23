@@ -1,22 +1,23 @@
-import logging
 from contextlib import asynccontextmanager
+
+from src.core.logging import setup_logging, get_logger
+
+setup_logging()
+logger = get_logger(__name__)
 
 from fastapi import FastAPI
 
 from src.api.jobs import router as jobs_router
 from src.api.metrics import router as metrics_router
-from src.core.database import engine, Base
+from src.core.db import get_db_instance
 from src.services.scheduler import start_scheduler, stop_scheduler
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables created")
+    db = get_db_instance()
+    db.sync_schema()
+    db.create_tables()
 
     start_scheduler()
     logger.info("Scheduler started")
@@ -26,7 +27,7 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
     logger.info("Scheduler stopped")
 
-    await engine.dispose()
+    db.engine.dispose()
     logger.info("Database engine disposed")
 
 
@@ -41,6 +42,7 @@ app.include_router(jobs_router)
 app.include_router(metrics_router)
 
 
+@app.get("/")
 @app.get("/health")
 async def health():
     return {"status": "healthy"}

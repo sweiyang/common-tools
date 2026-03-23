@@ -1,5 +1,18 @@
 database:
-  url: "postgresql+asyncpg://yugabyte:yugabyte@localhost:5433/yugabyte"
+  dev:
+    host: "localhost"
+    port: 5433
+    dbname: "yugabyte"
+    user: "yugabyte"
+    credential: "yugabyte"
+    schema: "metrics"
+  prod:
+    host: "localhost"
+    port: 5433
+    dbname: "yugabyte"
+    user: "yugabyte"
+    credential: "yugabyte"
+    schema: "metrics"
 
 auth:
   api_key: "change-me-to-a-real-secret"
@@ -7,3 +20,7 @@ auth:
 server:
   host: "0.0.0.0"
   port: 8000
+
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} - {extra[name]} - {level} - {message}"

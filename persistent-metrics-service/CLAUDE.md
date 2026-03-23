@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Service Does
 
-A FastAPI relay that makes Prometheus metrics durable. It polls Prometheus on a schedule (via registered "jobs"), persists samples in YugabyteDB, and re-exposes them at `GET /metrics` for external Prometheus scraping. Metrics survive restarts of the original source systems.
+A FastAPI relay that makes Prometheus counter metrics durable. It polls Prometheus on a schedule (via registered "jobs"), detects counter resets, accumulates values, persists them in YugabyteDB, and re-exposes them at `GET /metrics` for external Prometheus scraping. Counter values survive restarts of both the original source systems and this service.
 
 ## Commands
 
@@ -12,7 +12,7 @@ A FastAPI relay that makes Prometheus metrics durable. It polls Prometheus on a 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.yaml.example config.yaml  # then edit api_key and DB URL
+cp config.yaml.example config.yaml  # then edit api_key and DB settings
 ```
 
 **Run the service:**
@@ -36,29 +36,44 @@ Source App → Prometheus → [this service polls via jobs] → YugabyteDB → G
 **Request flow for metric collection:**
 1. User registers a job (`POST /jobs`) with a Prometheus URL, PromQL query, and interval
 2. `scheduler.py` (APScheduler `BackgroundScheduler` in a thread) fires the job on its interval
-3. `fetcher.py` calls Prometheus `/api/v1/query_range` from `last_queried_at` to now
-4. `metrics_repository.py` bulk-inserts samples with `ON CONFLICT DO NOTHING` dedup
-5. `GET /metrics` uses `DISTINCT ON (metric_name, labels)` to return the latest value per label set in Prometheus text format
+3. `fetcher.py` runs an instant query (`/api/v1/query`) against Prometheus
+4. `metrics_repository.py` (`process_samples`) detects counter resets and updates `counter_states`
+5. `GET /metrics` reads `counter_states` and returns `checkpoint + last_raw_value` per series in Prometheus text format (type `counter`)
 
 **Key design points:**
-- `last_queried_at` on the Job model enables incremental fetching — only new samples are fetched each run
+- Counter reset detection: if the new raw value < the previous raw value, the checkpoint is advanced by the previous raw value, and accumulation continues seamlessly
+- `counter_states` stores one row per (job, metric_name, labels) with `current_value` and `checkpoint`
 - Labels are stored as JSONB with a GIN index for flexible querying
-- The scheduler bridges sync APScheduler → async coroutines via `asyncio.run()` in `_run_async()`
+- All DB operations are **sync** (psycopg2 driver, sync SQLAlchemy sessions)
+- The `Database` class (`src/core/db/db.py`) handles schema creation, search_path, column sync, and table creation
 - `/metrics` is unauthenticated; all `/jobs/*` endpoints require `X-API-Key` header
-- DB tables are created on startup via SQLAlchemy `create_all` (no migrations)
+- DB tables are created on startup via `db.sync_schema()` + `db.create_tables()`
+- Logging uses loguru via `src/core/logging.py` (`setup_logging()` / `get_logger()`)
+- Jobs have a required `application_name` field. Metric names in `/metrics` output are prefixed with the job's `application_name` (e.g., `myapp_http_requests_total`)
+- `base_value` on `counter_states` provides an initial offset for historical/migrated data. The exposed metric value is `base_value + count` (where count = checkpoint + current_value). Set via `PATCH /jobs/{job_id}/base-values` (requires the counter_state row to already exist from at least one job run).
+- **Metric conflict detection** (`src/services/conflict_checker.py`): on job creation/update, the service fetches samples and checks if any `(metric_name, labels)` pairs already exist in `counter_states` under a different job. If conflicts are found, `POST /jobs` and `PATCH /jobs/{id}` return 409. `POST /jobs/test` reports conflicts without blocking.
 
 ## Configuration
 
-Config is loaded from `config.yaml` (path overridable via `CONFIG_PATH` env var):
+Config is loaded from `config.yaml` (path overridable via `CONFIG_PATH` env var). Environment-aware DB config via `APP_ENV` env var (defaults to `"prod"`):
 
 ```yaml
 database:
-  url: "postgresql+asyncpg://yugabyte:yugabyte@localhost:5433/yugabyte"
+  prod:
+    host: "localhost"
+    port: 5433
+    dbname: "yugabyte"
+    user: "yugabyte"
+    credential: "yugabyte"
+    schema: "metrics"
 auth:
   api_key: "your-secret-key"
 server:
   host: "0.0.0.0"
   port: 8000
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} - {extra[name]} - {level} - {message}"
 ```
 
-YugabyteDB is PostgreSQL-compatible (YSQL). The asyncpg driver is used throughout.
+YugabyteDB is PostgreSQL-compatible (YSQL). The psycopg2 driver is used throughout.

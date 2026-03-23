@@ -1,22 +1,21 @@
 from __future__ import annotations
 
-import asyncio
-import logging
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 
-from src.core.database import async_session
-from src.models.job import Job
-from src.services.fetcher import fetch_range
-from src.services.metrics_repository import bulk_insert_samples, update_last_queried_at
+from src.core.db import get_db_instance
+from src.core.db.db_models import Job
+from src.core.logging import get_logger
+from src.services.fetcher import Sample, fetch_instant, fetch_metrics_endpoint
+from src.services.metrics_repository import process_samples
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _scheduler: BackgroundScheduler | None = None
-_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _get_scheduler() -> BackgroundScheduler:
@@ -26,44 +25,59 @@ def _get_scheduler() -> BackgroundScheduler:
     return _scheduler
 
 
-def _run_async(coro):
-    """Run an async coroutine from the sync APScheduler thread."""
-    loop = _loop or asyncio.new_event_loop()
-    return loop.run_until_complete(coro)
+def fetch_job_samples(
+    url: str,
+    query: str | None,
+    source_type: str,
+    offset_seconds: int = 0,
+) -> list[Sample]:
+    """Fetch samples based on job configuration. Reusable by scheduler and test endpoint."""
+    if source_type == "metrics_endpoint":
+        metric_filter = query if query else None
+        return fetch_metrics_endpoint(target_url=url, metric_filter=metric_filter)
+    else:
+        # source_type == "prometheus"
+        query_time = None
+        if offset_seconds > 0:
+            query_time = datetime.now(timezone.utc).timestamp() - offset_seconds
+        return fetch_instant(
+            url=url,
+            query=query or "",
+            query_time=query_time,
+        )
 
 
-async def _execute_job(job_id: uuid.UUID) -> None:
-    async with async_session() as session:
-        job = await session.get(Job, job_id)
+def _execute_job(job_id: uuid.UUID) -> None:
+    db = get_db_instance()
+    session = db.get_session()
+    try:
+        job = session.get(Job, job_id)
         if job is None or not job.enabled:
-            logger.warning("Job %s not found or disabled, skipping", job_id)
+            logger.warning("Job {} not found or disabled, skipping", job_id)
             return
-
-        now = datetime.now(timezone.utc)
-        start = job.last_queried_at or (now - timedelta(seconds=job.interval_seconds))
 
         try:
-            samples = await fetch_range(
-                prometheus_url=job.prometheus_url,
+            samples = fetch_job_samples(
+                url=job.url,
                 query=job.query,
-                start=start,
-                end=now,
-                step=job.step,
+                source_type=job.source_type,
+                offset_seconds=job.offset_seconds,
             )
         except Exception:
-            logger.exception("Fetch failed for job %s", job_id)
+            logger.exception("Fetch failed for job {}", job_id)
             return
 
-        await bulk_insert_samples(session, job_id, samples, fetched_at=now)
-        await update_last_queried_at(session, job_id, queried_at=now)
+        process_samples(session, job_id, samples)
+    finally:
+        session.close()
 
 
 def _job_tick(job_id: uuid.UUID) -> None:
     """Sync wrapper invoked by APScheduler."""
     try:
-        _run_async(_execute_job(job_id))
+        _execute_job(job_id)
     except Exception:
-        logger.exception("Error in scheduled tick for job %s", job_id)
+        logger.exception("Error in scheduled tick for job {}", job_id)
 
 
 def add_scheduler_job(job: Job) -> None:
@@ -73,15 +87,26 @@ def add_scheduler_job(job: Job) -> None:
     if scheduler.get_job(scheduler_job_id):
         scheduler.remove_job(scheduler_job_id)
 
-    scheduler.add_job(
-        _job_tick,
-        "interval",
-        seconds=job.interval_seconds,
-        id=scheduler_job_id,
-        args=[job.id],
-        replace_existing=True,
-    )
-    logger.info("Scheduled job %s every %ds", job.id, job.interval_seconds)
+    if job.cron_expression:
+        trigger = CronTrigger.from_crontab(job.cron_expression)
+        scheduler.add_job(
+            _job_tick,
+            trigger,
+            id=scheduler_job_id,
+            args=[job.id],
+            replace_existing=True,
+        )
+        logger.info("Scheduled job {} with cron '{}'", job.id, job.cron_expression)
+    else:
+        scheduler.add_job(
+            _job_tick,
+            "interval",
+            seconds=job.interval_seconds,
+            id=scheduler_job_id,
+            args=[job.id],
+            replace_existing=True,
+        )
+        logger.info("Scheduled job {} every {}s", job.id, job.interval_seconds)
 
 
 def remove_scheduler_job(job_id: uuid.UUID) -> None:
@@ -89,23 +114,23 @@ def remove_scheduler_job(job_id: uuid.UUID) -> None:
     sid = str(job_id)
     if scheduler.get_job(sid):
         scheduler.remove_job(sid)
-        logger.info("Removed scheduler job %s", job_id)
+        logger.info("Removed scheduler job {}", job_id)
 
 
 def start_scheduler() -> None:
-    global _loop
-    _loop = asyncio.get_event_loop()
     scheduler = _get_scheduler()
 
-    async def _load_jobs():
-        async with async_session() as session:
-            result = await session.execute(select(Job).where(Job.enabled == True))  # noqa: E712
-            jobs = result.scalars().all()
-            for job in jobs:
-                add_scheduler_job(job)
-            logger.info("Loaded %d jobs into scheduler", len(jobs))
+    db = get_db_instance()
+    session = db.get_session()
+    try:
+        result = session.execute(select(Job).where(Job.enabled == True))  # noqa: E712
+        jobs = result.scalars().all()
+        for job in jobs:
+            add_scheduler_job(job)
+        logger.info("Loaded {} jobs into scheduler", len(jobs))
+    finally:
+        session.close()
 
-    _loop.run_until_complete(_load_jobs())
     scheduler.start()
 
 
