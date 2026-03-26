@@ -2,7 +2,7 @@
 
 **Date:** 23 March 2026
 **Status:** Draft
-**Version:** 3.0
+**Version:** 3.1
 
 ---
 
@@ -51,33 +51,37 @@ By separating auth from config, each service has a clear, single responsibility,
 
 A **standalone authentication microservice** that owns the full client auth lifecycle:
 
-- **Client registration** — register client applications with credentials.
-- **Token issuance** — authenticate client credentials and issue signed JWTs.
+- **LDAP pre-authentication** — customers must first authenticate via LDAP before requesting a token.
+- **Dual-environment token issuance:**
+  - **Preprod** (`/preprod/auth/token`) — customers self-service. After LDAP auth, customer passes `client_app` + `server_application` to generate a token.
+  - **Prod** (`/prod/auth/token`) — admin-only. Admin authenticates via Basic Auth (`service_id` + `service_key`), which the Auth Center validates against the **Config Center's services table**. Admin then generates a production token on behalf of the client.
+- **Token persistence** — all issued tokens are stored in the database for audit, revocation, and lifecycle management.
 - **Token verification** — validate JWT signature, expiry, and revocation status.
-- **Credential management** — support multiple secrets per client, rotation, and expiry.
 - **Token revocation** — immediately invalidate compromised tokens.
 
-The Auth Center does **not** know or care about what the client is allowed to do — that's the Config Center's job.
+The Auth Center does **not** know or care about what the client is allowed to do — that's the Config Center's job. However, for **production token issuance**, it depends on the Config Center to validate admin credentials.
 
 ### 3.2 Config Center
 
-A **standalone configuration microservice** that owns namespace-scoped client configuration:
+A **standalone configuration microservice** that owns namespace-scoped client configuration and **service authentication**:
 
+- **Service registration** — each consuming service (e.g. Indexing Hub) and admin is registered with a `service_id` + `service_key`. This is how they authenticate to the Config Center.
 - **Namespace registration** — each consuming service registers a namespace (e.g. `indexing-hub`).
 - **Config CRUD** — store key-value pairs (JSONB) scoped to a client + namespace.
-- **Config lookup** — consuming services query config for a given client and namespace.
+- **Config lookup** — consuming services authenticate with `service_id` + `service_key`, then query config for a given client and namespace.
 - **Subscription model** — consuming services can subscribe (poll or webhook) to config changes so they maintain a local cache that stays in sync.
-
-The Config Center does **not** issue or verify tokens — that's the Auth Center's job.
+- **Admin credential validation** — the Auth Center calls the Config Center to validate admin `service_id` + `service_key` during production token issuance.
 
 ### 3.3 How They Work Together
 
-The two services are independent but complementary. A consuming service like the Indexing Hub uses both:
+The two services are complementary with a specific cross-dependency for production auth:
 
-1. **Auth Center** to verify "is this client authenticated?"
-2. **Config Center** to check "what is this client configured to do in my service?"
+1. **Auth Center** owns client authentication and token lifecycle.
+2. **Config Center** owns service authentication (`service_id` + `service_key`), namespace-scoped configuration, and serves as the credential store for admin/service access.
+3. For **production token issuance**, the Auth Center calls the Config Center to validate the admin's `service_id` + `service_key`.
+4. For **request authorization**, consuming services authenticate to the Config Center using their own `service_id` + `service_key` to fetch client config.
 
-Neither service depends on the other at runtime. They share a common key — `client_app_id` — which is the link between a client's identity and their configuration.
+They share `client_app_id` as the common key linking a client's identity to their configuration.
 
 ### 3.4 Token Design
 
@@ -87,20 +91,24 @@ Tokens are **identity-only JWTs** signed by the Auth Center:
 {
   "sub": "service-alpha",
   "iss": "auth-center",
+  "env": "preprod",
+  "client_app": "my-app",
+  "server_application": "indexing-hub",
   "iat": 1711152000,
   "exp": 1711155600,
   "jti": "unique-token-id"
 }
 ```
 
-No config is embedded. Config is always fetched from the Config Center, so changes take effect immediately without requiring a token refresh.
+Tokens include the environment (`preprod` or `prod`), the `client_app`, and the `server_application` they were issued for. No config is embedded — config is always fetched from the Config Center, so changes take effect immediately without requiring a token refresh.
 
 ### 3.5 Design Principles
 
-- **Separation of concerns:** Auth and config are independent services with no runtime coupling.
+- **Separation of concerns:** Auth Center owns identity and tokens; Config Center owns service credentials and configuration.
+- **Environment isolation:** Preprod and prod have separate token issuance flows with different access controls.
 - **Service-agnostic:** The Config Center uses namespaces — no service-specific code anywhere.
 - **Zero-code onboarding:** Adding a client or config entry is an API call, never a code change.
-- **Single source of truth:** Auth Center owns identity; Config Center owns configuration.
+- **Single source of truth:** Auth Center owns tokens; Config Center owns service credentials and configuration.
 - **Performance-first:** Both services use caching. Consuming services maintain a local config cache via subscription.
 - **Fail-closed:** If either service is unreachable, consuming services deny the request.
 
@@ -113,25 +121,31 @@ No config is embedded. Config is always fetched from the Config Center, so chang
 ```mermaid
 graph LR
     Customer["🧑 Customer"]
+    LDAP["🏢 LDAP"]
+    Admin["👤 Admin"]
     AuthCenter["🔐 Auth Center"]
     ConfigCenter["📋 Config Center"]
     IndexingHub["⚙️ Indexing Hub"]
-    FutureSvc["⚙️ Future Service X"]
     ES["🔍 Elasticsearch"]
     AuthDB[("🗄️ Auth DB")]
     ConfigDB[("🗄️ Config DB")]
 
-    Customer -- "1. POST /auth/token<br/>(client_id + secret)" --> AuthCenter
-    AuthCenter -- "2. JWT" --> Customer
-    Customer -- "3. Request + JWT<br/>+ target ES index" --> IndexingHub
-    IndexingHub -- "4. POST /auth/verify<br/>(JWT)" --> AuthCenter
-    AuthCenter -- "5. { client_app_id }" --> IndexingHub
-    IndexingHub -- "6. Lookup config<br/>(client_app_id, namespace)" --> ConfigCenter
-    ConfigCenter -- "7. { allowed_es_indices, ... }" --> IndexingHub
-    IndexingHub -- "8. Authorized ingestion" --> ES
+    Customer -- "1a. LDAP auth" --> LDAP
+    LDAP -- "1b. Authenticated" --> Customer
+    Customer -- "2. POST /preprod/auth/token<br/>(client_app + server_application)" --> AuthCenter
+    AuthCenter -- "3. JWT (stored in DB)" --> Customer
 
-    FutureSvc -. "same pattern" .-> AuthCenter
-    FutureSvc -. "same pattern" .-> ConfigCenter
+    Admin -- "2'. POST /prod/auth/token<br/>(Basic Auth: service_id + service_key)" --> AuthCenter
+    AuthCenter -- "2'a. Validate admin credentials" --> ConfigCenter
+    ConfigCenter -- "2'b. Valid / Invalid" --> AuthCenter
+    AuthCenter -- "3'. JWT (stored in DB)" --> Admin
+
+    Customer -- "4. Request + JWT + target ES index" --> IndexingHub
+    IndexingHub -- "5. POST /auth/verify (JWT)" --> AuthCenter
+    AuthCenter -- "6. { client_app_id }" --> IndexingHub
+    IndexingHub -- "7. Authenticate with<br/>service_id + service_key<br/>+ lookup config" --> ConfigCenter
+    ConfigCenter -- "8. { allowed_es_indices, ... }" --> IndexingHub
+    IndexingHub -- "9. Authorized ingestion" --> ES
 
     AuthCenter --> AuthDB
     ConfigCenter --> ConfigDB
@@ -143,7 +157,7 @@ graph LR
 graph TB
     subgraph "SDK Layer"
         AuthSDK["Auth SDK<br/>- AuthCenterClient.verify()<br/>- AuthCenterAuth.get_token()<br/>- Local JWKS cache"]
-        ConfigSDK["Config SDK<br/>- ConfigCenterClient.get_config()<br/>- ConfigCenterClient.invalidate()<br/>- Local TTL cache<br/>- Webhook handler"]
+        ConfigSDK["Config SDK<br/>- ConfigCenterClient(service_id, service_key)<br/>- ConfigCenterClient.get_config()<br/>- ConfigCenterClient.invalidate()<br/>- Local TTL cache · Webhook handler"]
     end
 
     subgraph "Consuming Services"
@@ -152,27 +166,28 @@ graph TB
     end
 
     subgraph "Auth Center"
-        TokenIssuer["Token Issuer<br/>- Authenticate credentials<br/>- Sign & issue JWT"]
+        PreprodIssuer["Preprod Token Issuer<br/>- LDAP pre-auth<br/>- client_app + server_application<br/>- Store token in DB"]
+        ProdIssuer["Prod Token Issuer<br/>- Basic Auth (service_id + service_key)<br/>- Validate via Config Center<br/>- Store token in DB"]
         TokenVerifier["Token Verifier<br/>- Validate JWT signature<br/>- Check expiry & revocation"]
-        CredMgmt["Credential Manager<br/>- Create / rotate secrets<br/>- Multi-secret support"]
-        AuthAdmin["Admin API<br/>- CRUD clients<br/>- CRUD credentials<br/>- Revoke tokens"]
+        AuthAdmin["Admin API<br/>- CRUD clients<br/>- Revoke tokens"]
         JWKS["JWKS Endpoint<br/>- Public key discovery"]
     end
 
     subgraph "Config Center"
+        ServiceAuth["Service Auth<br/>- Validate service_id + service_key<br/>- Gate all API access"]
         ConfigLookup["Config Lookup<br/>- Namespace-scoped query<br/>- TTL cache layer"]
         ConfigSubscription["Subscription Service<br/>- Webhook / polling<br/>- Push change events"]
-        ConfigAdmin["Admin API<br/>- CRUD namespaces<br/>- CRUD client configs<br/>- Bulk upsert"]
+        ConfigAdmin["Admin API<br/>- CRUD namespaces<br/>- CRUD client configs<br/>- CRUD services<br/>- Bulk upsert"]
         ConfigAudit["Audit Service<br/>- Log all mutations"]
     end
 
     subgraph "Auth Storage"
-        AuthDB[("PostgreSQL<br/>clients · credentials<br/>revoked_tokens")]
+        AuthDB[("PostgreSQL<br/>clients · issued_tokens")]
         AuthCache["TTL Cache"]
     end
 
     subgraph "Config Storage"
-        ConfigDB[("PostgreSQL<br/>namespaces · client_configs<br/>audit_log")]
+        ConfigDB[("PostgreSQL<br/>services · namespaces<br/>client_configs · audit_log")]
         ConfigCache["TTL Cache"]
     end
 
@@ -182,47 +197,81 @@ graph TB
     FutureSvc --> ConfigSDK
 
     AuthSDK -- "POST /auth/verify" --> TokenVerifier
-    AuthSDK -- "POST /auth/token" --> TokenIssuer
+    AuthSDK -- "POST /preprod/auth/token" --> PreprodIssuer
     AuthSDK -. "GET /.well-known/jwks.json<br/>(optional local verify)" .-> JWKS
 
-    ConfigSDK -- "GET /config/lookup" --> ConfigLookup
+    ConfigSDK -- "service_id + service_key" --> ServiceAuth
+    ServiceAuth -- "authenticated" --> ConfigLookup
     ConfigSubscription -- "webhook push" --> ConfigSDK
 
-    TokenIssuer --> AuthDB
+    ProdIssuer -- "validate admin<br/>service_id + service_key" --> ServiceAuth
+
+    PreprodIssuer --> AuthDB
+    ProdIssuer --> AuthDB
     TokenVerifier --> AuthCache
     AuthCache -. "miss" .-> AuthDB
-    CredMgmt --> AuthDB
     AuthAdmin --> AuthDB
 
-    ConfigLookup --> ConfigCache
+    ServiceAuth --> ConfigCache
     ConfigCache -. "miss" .-> ConfigDB
+    ConfigLookup --> ConfigCache
     ConfigAdmin --> ConfigDB
     ConfigAdmin -- "notify" --> ConfigSubscription
     ConfigAdmin --> ConfigAudit
     ConfigAudit --> ConfigDB
 ```
 
-### 4.3 Token Issuance Flow
+### 4.3 Token Issuance Flow — Preprod (Customer Self-Service)
 
 ```mermaid
 sequenceDiagram
     participant C as Customer
+    participant LDAP as LDAP
     participant AC as Auth Center
     participant DB as Auth DB
 
-    C->>AC: 1. POST /auth/token (client_id, client_secret)
-    AC->>DB: 2. Lookup client + credentials
-    DB-->>AC: 3. Client record + hashed secrets
-    AC->>AC: 4. Verify secret, check is_active
-    alt Valid credentials
-        AC->>AC: 5. Sign JWT (sub=client_app_id, exp, jti)
-        AC-->>C: 6. { access_token: "eyJ...", expires_in: 3600 }
+    C->>LDAP: 1. Authenticate (username + password)
+    LDAP-->>C: 2. LDAP session / token
+    C->>AC: 3. POST /preprod/auth/token (client_app, server_application)
+    AC->>AC: 4. Validate LDAP session
+    AC->>DB: 5. Lookup client by client_app
+    DB-->>AC: 6. Client record
+    alt Valid client & LDAP session
+        AC->>AC: 7. Sign JWT (sub, client_app, server_application, env=preprod)
+        AC->>DB: 8. Store issued token in DB
+        AC-->>C: 9. { access_token: "eyJ...", expires_in: 3600 }
     else Invalid
         AC-->>C: 401 Unauthorized
     end
 ```
 
-### 4.4 Request Authorization Flow
+### 4.4 Token Issuance Flow — Prod (Admin Only)
+
+```mermaid
+sequenceDiagram
+    participant A as Admin
+    participant AC as Auth Center
+    participant CC as Config Center
+    participant DB as Auth DB
+
+    A->>AC: 1. POST /prod/auth/token (client_app, server_application)<br/>Header: Authorization: Basic (service_id:service_key)
+    AC->>AC: 2. Extract service_id + service_key from Basic Auth
+    AC->>CC: 3. Validate admin credentials (service_id + service_key)
+    CC->>CC: 4. Lookup services table, verify hashed service_key
+    alt Valid admin credentials
+        CC-->>AC: 5. Valid ✓
+        AC->>DB: 6. Lookup client by client_app
+        DB-->>AC: 7. Client record
+        AC->>AC: 8. Sign JWT (sub, client_app, server_application, env=prod)
+        AC->>DB: 9. Store issued token in DB
+        AC-->>A: 10. { access_token: "eyJ...", expires_in: 3600 }
+    else Invalid admin credentials
+        CC-->>AC: 5. Invalid ✗
+        AC-->>A: 401 Unauthorized
+    end
+```
+
+### 4.5 Request Authorization Flow
 
 ```mermaid
 sequenceDiagram
@@ -232,17 +281,24 @@ sequenceDiagram
     participant CC as Config Center
     participant ES as Elasticsearch
 
+    Note over IH: On startup: initialise ConfigCenterClient SDK<br/>with service_id + service_key
+    IH->>IH: 0a. config_client = ConfigCenterClient(service_id, service_key)
+    IH->>CC: 0b. SDK calls POST /auth/validate (Basic Auth)
+    CC->>CC: Validate service credentials
+    CC-->>IH: 200 OK — Authenticated ✓
+    Note over IH: SDK is ready. All subsequent calls<br/>go through config_client
+
     C->>IH: 1. Request + JWT + target ES index
     IH->>AC: 2. POST /auth/verify (JWT)
     AC->>AC: 3. Validate signature, expiry, revocation
     AC-->>IH: 4. { client_app_id: "service-alpha" }
-    IH->>IH: 5. Check local config cache
-    alt Config cached
-        IH->>IH: Use cached config
-    else Cache miss or expired
-        IH->>CC: 6. GET /config/lookup (client_app_id, namespace)
+    IH->>IH: 5. config_client.get_config(client_app_id, namespace)
+    alt SDK local cache hit
+        IH->>IH: Return cached config
+    else SDK cache miss or expired
+        IH->>CC: 6. SDK calls GET /config/lookup<br/>(Basic Auth injected by SDK)
         CC-->>IH: 7. { allowed_es_indices: [...], ... }
-        IH->>IH: Update local cache
+        IH->>IH: SDK caches result locally
     end
     IH->>IH: 8. Is target index in allowed_es_indices?
     alt Authorized
@@ -254,7 +310,7 @@ sequenceDiagram
     end
 ```
 
-### 4.5 Config Subscription Flow
+### 4.6 Config Subscription Flow
 
 ```mermaid
 sequenceDiagram
@@ -282,7 +338,8 @@ sequenceDiagram
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
 | id | UUID (PK) | No | Internal unique identifier. |
-| client_app_id | VARCHAR(255), UNIQUE | No | Public client identifier. Used as `sub` in JWTs. |
+| client_app_id | VARCHAR(255), UNIQUE | No | The client application identifier. Used as `sub` in JWTs. |
+| server_application | VARCHAR(255) | No | The server/service this client is associated with (e.g. `indexing-hub`). |
 | display_name | VARCHAR(255) | Yes | Human-readable name. |
 | is_active | BOOLEAN | No | Global kill switch. Inactive clients cannot authenticate. |
 | token_expiry_seconds | INTEGER | No | Per-client JWT expiry. Default: 3600. |
@@ -290,40 +347,36 @@ sequenceDiagram
 | created_at | TIMESTAMP | No | Record creation timestamp. |
 | updated_at | TIMESTAMP | No | Last modification timestamp. |
 
-#### 5.2 client_credentials
+#### 5.2 issued_tokens
+
+All issued tokens are persisted for audit, lifecycle management, and revocation.
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
 | id | UUID (PK) | No | Internal unique identifier. |
-| client_id | UUID (FK → clients.id) | No | The client this credential belongs to. |
-| client_secret_hash | VARCHAR(512) | No | Bcrypt/Argon2 hash. Never stored in plaintext. |
-| label | VARCHAR(128) | Yes | Label for managing multiple secrets (e.g. "production"). |
-| is_active | BOOLEAN | No | Allows disabling without deleting (for rotation). |
-| expires_at | TIMESTAMP | Yes | Optional credential expiry. Null = no expiry. |
-| created_at | TIMESTAMP | No | Record creation timestamp. |
+| jti | VARCHAR(255), UNIQUE | No | The JWT ID claim. Used as the lookup key for revocation. |
+| client_id | UUID (FK → clients.id) | No | The client this token was issued for. |
+| environment | VARCHAR(16) | No | `preprod` or `prod`. |
+| issued_by | VARCHAR(255) | No | Who issued the token — LDAP username (preprod) or admin service_id (prod). |
+| token_hash | VARCHAR(512) | No | SHA-256 hash of the JWT (never store the raw token). |
+| issued_at | TIMESTAMP | No | When the token was issued. |
+| expires_at | TIMESTAMP | No | When the token expires. |
+| is_revoked | BOOLEAN | No | Whether this token has been revoked. Default: false. |
+| revoked_at | TIMESTAMP | Yes | When the token was revoked (if applicable). |
+| revoke_reason | VARCHAR(255) | Yes | Why the token was revoked. |
 
-A client can have multiple active credentials for zero-downtime secret rotation.
-
-#### 5.3 revoked_tokens
-
-| Column | Type | Nullable | Description |
-|--------|------|----------|-------------|
-| jti | VARCHAR(255) (PK) | No | The JWT ID of the revoked token. |
-| client_id | UUID (FK → clients.id) | No | The client whose token was revoked. |
-| revoked_at | TIMESTAMP | No | When the revocation occurred. |
-| expires_at | TIMESTAMP | No | When the token would have expired. Rows cleaned up after this. |
-| reason | VARCHAR(255) | Yes | Why the token was revoked. |
+**Design note:** By storing tokens in a single table with `is_revoked`, we combine issuance and revocation tracking. The separate `revoked_tokens` table from the previous design is no longer needed — revocation is a flag on the issued token record.
 
 #### Auth Center ER Diagram
 
 ```mermaid
 erDiagram
-    clients ||--o{ client_credentials : "has many"
-    clients ||--o{ revoked_tokens : "has many"
+    clients ||--o{ issued_tokens : "has many"
 
     clients {
         UUID id PK
         VARCHAR client_app_id UK
+        VARCHAR server_application
         VARCHAR display_name
         BOOLEAN is_active
         INTEGER token_expiry_seconds
@@ -332,22 +385,18 @@ erDiagram
         TIMESTAMP updated_at
     }
 
-    client_credentials {
+    issued_tokens {
         UUID id PK
+        VARCHAR jti UK
         UUID client_id FK
-        VARCHAR client_secret_hash
-        VARCHAR label
-        BOOLEAN is_active
+        VARCHAR environment
+        VARCHAR issued_by
+        VARCHAR token_hash
+        TIMESTAMP issued_at
         TIMESTAMP expires_at
-        TIMESTAMP created_at
-    }
-
-    revoked_tokens {
-        VARCHAR jti PK
-        UUID client_id FK
+        BOOLEAN is_revoked
         TIMESTAMP revoked_at
-        TIMESTAMP expires_at
-        VARCHAR reason
+        VARCHAR revoke_reason
     }
 ```
 
@@ -355,7 +404,25 @@ erDiagram
 
 ### Config Center Database
 
-#### 5.4 namespaces
+#### 5.4 services
+
+The authentication table for consuming services and admins. Every caller of the Config Center API must authenticate with a `service_id` + `service_key`. The Auth Center also validates admin credentials against this table during production token issuance.
+
+| Column | Type | Nullable | Description |
+|--------|------|----------|-------------|
+| id | UUID (PK) | No | Internal unique identifier. |
+| service_id | VARCHAR(255), UNIQUE | No | Public identifier for the service (e.g. `indexing-hub`, `admin-platform`). |
+| service_key_hash | VARCHAR(512) | No | Bcrypt/Argon2 hash of the service key. Never stored in plaintext. |
+| display_name | VARCHAR(255) | Yes | Human-readable name. |
+| role | VARCHAR(32) | No | `service` or `admin`. Admins can generate prod tokens via Auth Center. |
+| is_active | BOOLEAN | No | Active flag. Inactive services are denied access. |
+| metadata | JSONB | Yes | Freeform metadata (team, contact, notes). |
+| created_at | TIMESTAMP | No | Record creation timestamp. |
+| updated_at | TIMESTAMP | No | Last modification timestamp. |
+
+**Design note:** The `role` field distinguishes between regular consuming services (which can only look up config) and admin services (which can also generate production tokens via the Auth Center). The service key is returned **once** at creation and never again.
+
+#### 5.5 namespaces
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
@@ -365,7 +432,7 @@ erDiagram
 | owner | VARCHAR(255) | Yes | Team or person responsible. |
 | created_at | TIMESTAMP | No | Record creation timestamp. |
 
-#### 5.5 client_configs
+#### 5.6 client_configs
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
@@ -382,7 +449,7 @@ erDiagram
 
 **Note:** The Config Center references `client_app_id` as a plain string, not a foreign key to the Auth Center's database. The two services have separate databases. The `client_app_id` is the shared contract between them.
 
-#### 5.6 subscriptions
+#### 5.7 subscriptions
 
 Tracks which consuming services subscribe to config change notifications.
 
@@ -395,7 +462,7 @@ Tracks which consuming services subscribe to config change notifications.
 | is_active | BOOLEAN | No | Active flag. |
 | created_at | TIMESTAMP | No | Record creation timestamp. |
 
-#### 5.7 audit_log
+#### 5.8 audit_log
 
 | Column | Type | Nullable | Description |
 |--------|------|----------|-------------|
@@ -412,8 +479,21 @@ Tracks which consuming services subscribe to config change notifications.
 
 ```mermaid
 erDiagram
+    services ||--o{ subscriptions : "subscribes"
     namespaces ||--o{ client_configs : "scopes"
     namespaces ||--o{ subscriptions : "has many"
+
+    services {
+        UUID id PK
+        VARCHAR service_id UK
+        VARCHAR service_key_hash
+        VARCHAR display_name
+        VARCHAR role
+        BOOLEAN is_active
+        JSONB metadata
+        TIMESTAMP created_at
+        TIMESTAMP updated_at
+    }
 
     namespaces {
         UUID id PK
@@ -436,6 +516,7 @@ erDiagram
 
     subscriptions {
         UUID id PK
+        UUID service_id FK
         UUID namespace_id FK
         VARCHAR callback_url
         VARCHAR secret
@@ -461,48 +542,81 @@ erDiagram
 
 ### 6.1 Auth Center API
 
-#### Customer-Facing
+#### Preprod — Customer-Facing (LDAP pre-auth required)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/auth/token` | Authenticate with client_id + client_secret, receive a signed JWT. |
+| POST | `/api/v1/preprod/auth/token` | Customer generates a preprod token. Requires valid LDAP session. Body: `client_app` + `server_application`. Token stored in DB. |
 | GET | `/api/v1/.well-known/jwks.json` | Public key(s) for local JWT verification by consuming services. |
+
+#### Prod — Admin-Only (Basic Auth: service_id + service_key)
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/v1/prod/auth/token` | Admin generates a prod token. Requires Basic Auth header (`service_id:service_key`), validated against Config Center's services table. Body: `client_app` + `server_application`. Token stored in DB. |
 
 #### Service-Facing
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/v1/auth/verify` | Verify a JWT. Returns `client_app_id` if valid. |
+| POST | `/api/v1/auth/verify` | Verify a JWT. Returns `client_app_id`, `server_application`, `environment` if valid. |
 | POST | `/api/v1/auth/revoke` | Revoke a token by its `jti`. |
 
 #### Admin API
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/v1/admin/clients` | List clients. Filter by `?search=`, `?is_active=`. |
+| GET | `/api/v1/admin/clients` | List clients. Filter by `?search=`, `?is_active=`, `?server_application=`. |
 | GET | `/api/v1/admin/clients/{id}` | Get a single client. |
-| POST | `/api/v1/admin/clients` | Register a new client. |
+| POST | `/api/v1/admin/clients` | Register a new client (client_app_id + server_application). |
 | PUT | `/api/v1/admin/clients/{id}` | Update client (toggle active, change expiry). |
-| DELETE | `/api/v1/admin/clients/{id}` | Deactivate client + revoke all tokens. |
-| GET | `/api/v1/admin/clients/{id}/credentials` | List credentials (secrets never returned). |
-| POST | `/api/v1/admin/clients/{id}/credentials` | Generate new credential (secret returned once). |
-| DELETE | `/api/v1/admin/credentials/{id}` | Delete a credential. |
-| POST | `/api/v1/admin/clients/{id}/credentials/rotate` | Generate new + schedule old for deactivation. |
+| DELETE | `/api/v1/admin/clients/{id}` | Deactivate client + revoke all active tokens. |
+| GET | `/api/v1/admin/tokens` | List issued tokens. Filter by `?client_app_id=`, `?environment=`, `?is_revoked=`. |
 
-#### Sample: POST /api/v1/auth/token
+#### Sample: POST /api/v1/preprod/auth/token
 
 ```json
-// Request
+// Request (LDAP session must be active)
 {
-  "client_id": "service-alpha",
-  "client_secret": "sk_live_abc123..."
+  "client_app": "my-app",
+  "server_application": "indexing-hub"
 }
 
 // Response (200 OK)
 {
   "access_token": "eyJhbGciOiJSUzI1NiIs...",
   "token_type": "Bearer",
-  "expires_in": 3600
+  "expires_in": 3600,
+  "environment": "preprod"
+}
+```
+
+#### Sample: POST /api/v1/prod/auth/token
+
+```http
+POST /api/v1/prod/auth/token
+Authorization: Basic base64(service_id:service_key)
+Content-Type: application/json
+
+{
+  "client_app": "my-app",
+  "server_application": "indexing-hub"
+}
+```
+
+```json
+// Response (200 OK)
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIs...",
+  "token_type": "Bearer",
+  "expires_in": 3600,
+  "environment": "prod"
+}
+
+// Response (401) — invalid admin credentials
+{
+  "error": "invalid_credentials",
+  "message": "Admin service_id or service_key is invalid."
 }
 ```
 
@@ -516,7 +630,9 @@ erDiagram
 
 // Response (200 OK)
 {
-  "client_app_id": "service-alpha",
+  "client_app_id": "my-app",
+  "server_application": "indexing-hub",
+  "environment": "preprod",
   "is_active": true
 }
 
@@ -531,15 +647,29 @@ erDiagram
 
 ### 6.2 Config Center API
 
+**All Config Center endpoints require authentication via `service_id` + `service_key`** (passed as Basic Auth header or via SDK initialization).
+
 #### Service-Facing
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| POST | `/api/v1/auth/validate` | Validate a `service_id` + `service_key`. Used by the Auth Center to validate admin credentials for prod token issuance. |
 | GET | `/api/v1/config/lookup` | Lookup config. Params: `client_app_id`, `namespace`. Returns all active key-value pairs. |
 | POST | `/api/v1/config/subscribe` | Subscribe to change notifications for a namespace. |
 | DELETE | `/api/v1/config/subscribe/{id}` | Unsubscribe. |
 
-#### Admin API
+#### Admin API — Services
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/admin/services` | List all registered services. Filter by `?role=`, `?is_active=`. |
+| GET | `/api/v1/admin/services/{id}` | Get a single service by ID. |
+| POST | `/api/v1/admin/services` | Register a new service or admin. Returns `service_key` **once**. Body: `service_id`, `display_name`, `role` (`service` or `admin`). |
+| PUT | `/api/v1/admin/services/{id}` | Update service metadata (display_name, is_active, metadata). |
+| DELETE | `/api/v1/admin/services/{id}` | Deactivate a service. Revokes its access. |
+| POST | `/api/v1/admin/services/{id}/rotate-key` | Rotate the service key. Returns new `service_key` **once**. Old key is invalidated. |
+
+#### Admin API — Namespaces & Configs
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -582,6 +712,51 @@ erDiagram
 
 The consuming service receives this webhook, invalidates its local cache for `service-alpha`, and fetches fresh config on the next request.
 
+#### Sample: POST /api/v1/admin/services
+
+```json
+// Request
+{
+  "service_id": "indexing-hub",
+  "display_name": "Indexing Hub",
+  "role": "service",
+  "metadata": { "team": "platform", "contact": "platform@company.com" }
+}
+
+// Response (201 Created) — service_key returned ONCE
+{
+  "id": "uuid-...",
+  "service_id": "indexing-hub",
+  "service_key": "sk_svc_a1b2c3d4e5f6...",
+  "display_name": "Indexing Hub",
+  "role": "service",
+  "is_active": true,
+  "message": "Store the service_key securely. It will not be shown again."
+}
+```
+
+#### Sample: POST /api/v1/auth/validate
+
+```http
+POST /api/v1/auth/validate
+Authorization: Basic base64(service_id:service_key)
+```
+
+```json
+// Response (200 OK)
+{
+  "service_id": "admin-platform",
+  "role": "admin",
+  "is_active": true
+}
+
+// Response (401) — invalid or inactive
+{
+  "error": "invalid_credentials",
+  "message": "Invalid service_id or service_key."
+}
+```
+
 ---
 
 ## 7. How the Indexing Hub Integrates (First Consumer)
@@ -589,27 +764,35 @@ The consuming service receives this webhook, invalidates its local cache for `se
 ### 7.1 Setup
 
 ```json
-// 1. Register client in Auth Center
+// 1. Register the Indexing Hub as a service in Config Center
+POST config-center/api/v1/admin/services
+{ "service_id": "indexing-hub", "display_name": "Indexing Hub", "role": "service" }
+// → { "service_key": "sk_svc_..." }  (returned once — store securely)
+
+// 2. Register an admin user in Config Center (for prod token issuance)
+POST config-center/api/v1/admin/services
+{ "service_id": "admin-platform", "display_name": "Admin Platform", "role": "admin" }
+// → { "service_key": "sk_adm_..." }  (returned once — store securely)
+
+// 3. Register client in Auth Center
 POST auth-center/api/v1/admin/clients
-{ "client_app_id": "service-alpha", "display_name": "Service Alpha", "is_active": true }
+{ "client_app_id": "service-alpha", "display_name": "Service Alpha",
+  "server_application": "indexing-hub", "is_active": true }
 
-// 2. Generate credentials in Auth Center
-POST auth-center/api/v1/admin/clients/{id}/credentials
-{ "label": "production" }
-// → { "client_secret": "sk_live_..." }  (returned once)
-
-// 3. Register namespace in Config Center
+// 4. Register namespace in Config Center
 POST config-center/api/v1/admin/namespaces
 { "name": "indexing-hub", "owner": "platform-team" }
 
-// 4. Add config in Config Center
+// 5. Add config in Config Center (authenticated with service_id + service_key)
 POST config-center/api/v1/admin/configs
+Authorization: Basic base64(indexing-hub:sk_svc_...)
 { "client_app_id": "service-alpha", "namespace": "indexing-hub",
   "config_key": "allowed_es_indices",
   "config_value": ["alpha-prod-index", "alpha-staging-index"] }
 
-// 5. Indexing Hub subscribes to config changes
+// 6. Indexing Hub subscribes to config changes
 POST config-center/api/v1/config/subscribe
+Authorization: Basic base64(indexing-hub:sk_svc_...)
 { "namespace": "indexing-hub",
   "callback_url": "https://indexing-hub.internal/webhooks/config-change",
   "secret": "whsec_..." }
@@ -617,13 +800,15 @@ POST config-center/api/v1/config/subscribe
 
 ### 7.2 Updated Indexing Hub Workflow
 
-1. Customer authenticates with the **Auth Center** (`POST /auth/token`) and receives a JWT.
-2. Customer sends the JWT + target ES index to the **Indexing Hub**.
-3. Indexing Hub verifies the JWT with the **Auth Center** (`POST /auth/verify`) → gets `client_app_id`.
-4. Indexing Hub checks its **local config cache** for `service-alpha` in namespace `indexing-hub`.
-5. On cache miss, Indexing Hub fetches config from the **Config Center** (`GET /config/lookup`).
-6. Indexing Hub checks if the requested ES index is in `allowed_es_indices`.
-7. If yes → ingest. If no → 403.
+1. **Startup:** Indexing Hub initializes a `ConfigCenterClient` with its `service_id` + `service_key`. The client validates credentials with Config Center (`POST /auth/validate`). On success, the Indexing Hub is ready to serve.
+2. **Customer token (preprod):** Customer authenticates via LDAP, then calls Auth Center (`POST /preprod/auth/token`) with `client_app` + `server_application` to get a JWT.
+3. **Admin token (prod):** Admin calls Auth Center (`POST /prod/auth/token`) with Basic Auth (`service_id:service_key`). Auth Center validates against Config Center, then issues a prod JWT.
+4. Customer sends the JWT + target ES index to the **Indexing Hub**.
+5. Indexing Hub verifies the JWT with the **Auth Center** (`POST /auth/verify`) → gets `client_app_id`, `server_application`, `environment`.
+6. Indexing Hub checks its **local config cache** for `service-alpha` in namespace `indexing-hub`.
+7. On cache miss, Indexing Hub fetches config from the **Config Center** (`GET /config/lookup`, authenticated with its `service_id` + `service_key`).
+8. Indexing Hub checks if the requested ES index is in `allowed_es_indices`.
+9. If yes → ingest. If no → 403.
 
 Config stays in sync because the Indexing Hub subscribes to the Config Center's webhooks. When an admin updates a mapping, the Indexing Hub's cache is invalidated automatically.
 
@@ -641,13 +826,23 @@ def verify_index_access(client_app_id, requested_index):
     if requested_index not in allowed:
         raise HTTPException(403, "Not authorized")
 
-# AFTER (Auth Center + Config Center)
+# AFTER (Auth Center + Config Center with service_id/service_key auth)
+from sdk import AuthCenterClient, ConfigCenterClient
+
+# Initialize at startup — Config Center validates credentials
+auth_client = AuthCenterClient(base_url="https://auth-center.internal")
+config_client = ConfigCenterClient(
+    base_url="https://config-center.internal",
+    service_id="indexing-hub",
+    service_key="sk_svc_...",
+)
+
 async def verify_index_access(token, requested_index):
     # Step 1: Verify identity via Auth Center
     identity = await auth_client.verify(token)
     client_app_id = identity["client_app_id"]
 
-    # Step 2: Get config via Config Center (with local cache)
+    # Step 2: Get config via Config Center (authenticated, with local cache)
     config = await config_client.get_config(client_app_id, namespace="indexing-hub")
     allowed = config.get("allowed_es_indices", [])
 
@@ -674,30 +869,52 @@ The webhook notifies the Indexing Hub, its cache refreshes, and the client can i
 
 The pattern is the same every time — no changes to either Auth Center or Config Center:
 
-**Step 1 — Register a namespace in Config Center:**
+**Step 1 — Register your service in Config Center:**
+
+```json
+POST config-center/api/v1/admin/services
+{ "service_id": "notification-hub", "display_name": "Notification Hub", "role": "service" }
+// → { "service_key": "sk_svc_..." }  (store securely)
+```
+
+**Step 2 — Register a namespace in Config Center:**
 
 ```json
 POST config-center/api/v1/admin/namespaces
+Authorization: Basic base64(notification-hub:sk_svc_...)
 { "name": "notification-hub", "owner": "comms-team" }
 ```
 
-**Step 2 — Add client configs under your namespace:**
+**Step 3 — Add client configs under your namespace:**
 
 ```json
 POST config-center/api/v1/admin/configs
+Authorization: Basic base64(notification-hub:sk_svc_...)
 { "client_app_id": "service-alpha", "namespace": "notification-hub",
   "config_key": "allowed_channels", "config_value": ["email", "sms"] }
 ```
 
-**Step 3 — Subscribe to config changes:**
+**Step 4 — Subscribe to config changes:**
 
 ```json
 POST config-center/api/v1/config/subscribe
+Authorization: Basic base64(notification-hub:sk_svc_...)
 { "namespace": "notification-hub",
   "callback_url": "https://notif-hub.internal/webhooks/config" }
 ```
 
-**Step 4 — Verify JWTs with Auth Center, fetch config from Config Center.** Customers use the same credentials and JWT — no new onboarding if they're already registered.
+**Step 5 — Initialize your SDK clients and integrate:**
+
+```python
+auth_client = AuthCenterClient(base_url="https://auth-center.internal")
+config_client = ConfigCenterClient(
+    base_url="https://config-center.internal",
+    service_id="notification-hub",
+    service_key="sk_svc_...",
+)
+```
+
+Verify JWTs with the Auth Center, fetch config from the Config Center (authenticated with `service_id` + `service_key`). Customers use the same LDAP + Auth Center flow — no new onboarding if they're already registered as clients.
 
 ---
 
@@ -711,9 +928,9 @@ POST config-center/api/v1/config/subscribe
 
 ### 9.2 Config Center Caching
 
-**Server-side (Config Center):** TTLCache or Redis for database query results. TTL: 5 minutes.
+**Server-side (Config Center):** TTLCache or Redis for database query results. TTL: 5 minutes. Service credential validation results can be cached briefly (30 seconds) to reduce DB load from frequent `/auth/validate` calls.
 
-**Client-side (Consuming services):** Each consuming service maintains a local config cache. This is the primary performance optimization — most requests are served entirely from the local cache, with no network call to the Config Center.
+**Client-side (Consuming services):** Each consuming service authenticates once with `service_id` + `service_key` (via the SDK's `validate()` call on startup) and then maintains a local config cache. This is the primary performance optimization — most requests are served entirely from the local cache, with no network call to the Config Center.
 
 Cache invalidation flow:
 
@@ -737,8 +954,9 @@ Cache invalidation flow:
 | Config Center framework | Python / FastAPI | Same stack for consistency. |
 | Auth database | PostgreSQL | Reliable, proven for auth workloads. |
 | Config database | PostgreSQL | JSONB support for flexible config values. |
+| LDAP integration | ldap3 (Python) | LDAP pre-authentication for preprod token issuance. |
 | JWT signing | PyJWT + cryptography | RS256/ES256. Key management via cryptography lib. |
-| Secret hashing | passlib (bcrypt/argon2) | Industry standard for credential hashing. |
+| Secret hashing | passlib (bcrypt/argon2) | Industry standard for credential and service_key hashing. |
 | Caching | cachetools.TTLCache | In-process. Upgrade to Redis for multi-instance. |
 | ORM / Migrations | SQLAlchemy + Alembic | Mature async support. |
 | Containerization | Docker | Separate images for each service. |
@@ -754,17 +972,21 @@ auth-center/
 ├── app/
 │   ├── main.py
 │   ├── api/v1/
-│   │   ├── auth.py               # /auth/token, /auth/verify, /auth/revoke
+│   │   ├── preprod_auth.py       # /preprod/auth/token (LDAP + token issuance)
+│   │   ├── prod_auth.py          # /prod/auth/token (Basic Auth admin flow)
+│   │   ├── auth.py               # /auth/verify, /auth/revoke
 │   │   ├── jwks.py               # /.well-known/jwks.json
 │   │   └── admin/
-│   │       ├── clients.py
-│   │       └── credentials.py
+│   │       ├── clients.py        # Client CRUD
+│   │       └── tokens.py         # Token listing, revocation
 │   ├── models/
 │   │   ├── client.py
-│   │   ├── client_credential.py
-│   │   └── revoked_token.py
+│   │   └── issued_token.py       # Issued + revocation tracking
 │   ├── services/
-│   │   ├── auth_service.py       # Credential verification
+│   │   ├── ldap_service.py       # LDAP pre-authentication
+│   │   ├── preprod_issuer.py     # Preprod token issuance (LDAP-gated)
+│   │   ├── prod_issuer.py        # Prod token issuance (admin-gated)
+│   │   ├── config_center_client.py  # HTTP client to validate admin creds
 │   │   └── token_service.py      # JWT sign, verify, revoke
 │   ├── crypto/
 │   │   └── keys.py               # RSA/EC key pair management
@@ -785,19 +1007,25 @@ config-center/
 ├── app/
 │   ├── main.py
 │   ├── api/v1/
+│   │   ├── service_auth.py       # /auth/validate (service_id + service_key)
 │   │   ├── config.py             # /config/lookup, /config/subscribe
 │   │   └── admin/
+│   │       ├── services.py       # Services CRUD + key rotation
 │   │       ├── namespaces.py
 │   │       └── configs.py
 │   ├── models/
+│   │   ├── service.py            # service_id, service_key_hash, role
 │   │   ├── namespace.py
 │   │   ├── client_config.py
 │   │   ├── subscription.py
 │   │   └── audit_log.py
 │   ├── services/
+│   │   ├── service_auth_service.py  # Validate service_id + service_key
 │   │   ├── config_service.py     # Lookup + cache
 │   │   ├── subscription_service.py  # Webhook dispatch
 │   │   └── audit_service.py
+│   ├── middleware/
+│   │   └── basic_auth.py         # Extract & validate Basic Auth on all requests
 │   ├── cache/
 │   │   └── ttl_cache.py
 │   └── db/
@@ -815,14 +1043,14 @@ config-center/
 ### For Consuming Services
 
 ```python
-# Auth Center client
+# Auth Center client — used by consuming services to verify JWTs
 class AuthCenterClient:
     def __init__(self, base_url: str, timeout: int = 5):
         self._base_url = base_url
         self._http = httpx.AsyncClient(timeout=timeout)
 
     async def verify(self, token: str) -> dict:
-        """Verify JWT. Returns { client_app_id, is_active }."""
+        """Verify JWT. Returns { client_app_id, server_application, environment, is_active }."""
         resp = await self._http.post(
             f"{self._base_url}/api/v1/auth/verify",
             json={"token": token},
@@ -831,12 +1059,30 @@ class AuthCenterClient:
         return resp.json()
 
 
-# Config Center client (with local cache + webhook support)
+# Config Center client — authenticated with service_id + service_key
 class ConfigCenterClient:
-    def __init__(self, base_url: str, timeout: int = 5, cache_ttl: int = 300):
+    def __init__(
+        self,
+        base_url: str,
+        service_id: str,
+        service_key: str,
+        timeout: int = 5,
+        cache_ttl: int = 300,
+    ):
         self._base_url = base_url
-        self._http = httpx.AsyncClient(timeout=timeout)
+        self._service_id = service_id
+        self._service_key = service_key
+        self._http = httpx.AsyncClient(
+            timeout=timeout,
+            auth=(service_id, service_key),  # Basic Auth on every request
+        )
         self._cache = TTLCache(maxsize=1024, ttl=cache_ttl)
+
+    async def validate(self) -> dict:
+        """Validate credentials on startup. Raises on failure."""
+        resp = await self._http.post(f"{self._base_url}/api/v1/auth/validate")
+        resp.raise_for_status()
+        return resp.json()
 
     async def get_config(self, client_app_id: str, namespace: str) -> dict:
         """Get config for a client in a namespace. Cached locally."""
@@ -858,32 +1104,61 @@ class ConfigCenterClient:
         self._cache.pop(f"{client_app_id}:{namespace}", None)
 ```
 
-### For Customers (Token Management)
+### For Customers (Preprod Token — LDAP Flow)
 
 ```python
-class AuthCenterAuth:
-    """Customer-facing SDK for obtaining and auto-refreshing tokens."""
+class AuthCenterPreprodAuth:
+    """Customer-facing SDK for obtaining preprod tokens via LDAP."""
 
-    def __init__(self, base_url: str, client_id: str, client_secret: str):
+    def __init__(self, base_url: str, ldap_username: str, ldap_password: str):
         self._base_url = base_url
-        self._client_id = client_id
-        self._client_secret = client_secret
+        self._ldap_username = ldap_username
+        self._ldap_password = ldap_password
         self._token = None
         self._expires_at = 0
 
-    async def get_token(self) -> str:
+    async def get_token(self, client_app: str, server_application: str) -> str:
+        """Authenticate via LDAP and get a preprod token."""
         if self._token and time.time() < self._expires_at - 60:
             return self._token
 
         resp = await httpx.AsyncClient().post(
-            f"{self._base_url}/api/v1/auth/token",
-            json={"client_id": self._client_id, "client_secret": self._client_secret},
+            f"{self._base_url}/api/v1/preprod/auth/token",
+            json={
+                "ldap_username": self._ldap_username,
+                "ldap_password": self._ldap_password,
+                "client_app": client_app,
+                "server_application": server_application,
+            },
         )
         resp.raise_for_status()
         data = resp.json()
         self._token = data["access_token"]
         self._expires_at = time.time() + data["expires_in"]
         return self._token
+```
+
+### For Admins (Prod Token — Basic Auth Flow)
+
+```python
+class AuthCenterProdAuth:
+    """Admin SDK for generating production tokens via service_id + service_key."""
+
+    def __init__(self, base_url: str, service_id: str, service_key: str):
+        self._base_url = base_url
+        self._http = httpx.AsyncClient(auth=(service_id, service_key))
+
+    async def generate_prod_token(self, client_app: str, server_application: str) -> dict:
+        """Generate a production token for a client (admin only)."""
+        resp = await self._http.post(
+            f"{self._base_url}/api/v1/prod/auth/token",
+            json={
+                "client_app": client_app,
+                "server_application": server_application,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
 ```
 
 ---
@@ -894,27 +1169,35 @@ class AuthCenterAuth:
 
 **JWT signing keys:** RS256 or ES256. Private key for signing only; public key distributed via JWKS endpoint. Store keys securely (secrets manager). Rotate periodically.
 
-**Client secrets:** Hashed with bcrypt/Argon2 before storage. Plaintext returned once at creation. Support multiple active credentials for zero-downtime rotation.
+**LDAP integration:** LDAP credentials are validated in real-time during preprod token issuance and are **never stored** in the Auth Center. Use LDAPS (LDAP over TLS) to protect credentials in transit. Implement connection pooling with timeouts to prevent LDAP server overload. Bind with a dedicated service account for lookups; customer credentials are used only for authentication binding.
 
-**Rate limiting:** `/auth/token` must be rate-limited with exponential backoff on failed attempts per `client_id` to prevent brute-force attacks.
+**Dual-environment isolation:** Preprod and prod token issuance use completely different authentication paths (LDAP vs. Basic Auth). Tokens include an `env` claim (`preprod` or `prod`) so consuming services can enforce environment-level access policies if needed.
 
-**Token revocation:** Deactivating a client revokes all active tokens immediately.
+**Admin credential validation:** For prod token issuance, the Auth Center delegates credential validation to the Config Center (`POST /auth/validate`). This call must happen over internal TLS. If the Config Center is unreachable, prod token issuance fails (fail-closed).
+
+**Token persistence:** All issued tokens are stored in the `issued_tokens` table with a hash of the token (not the raw JWT). This enables revocation by `jti` and full audit of token lifecycle.
+
+**Rate limiting:** Both `/preprod/auth/token` and `/prod/auth/token` must be rate-limited with exponential backoff on failed attempts to prevent brute-force attacks. Rate-limit separately by LDAP username (preprod) and service_id (prod).
+
+**Token revocation:** Deactivating a client revokes all active tokens immediately. The `is_revoked` flag in `issued_tokens` is checked on every `/auth/verify` call.
 
 ### Config Center
 
-**Admin API access control:** Protected by API keys, OAuth2 scopes, or RBAC — separate from both customer tokens and Auth Center admin access.
+**Service authentication:** All API endpoints are gated by `service_id` + `service_key` (Basic Auth). Service keys are hashed with bcrypt/Argon2 before storage. Plaintext is returned **once** at creation and never again. Key rotation is supported via the `/admin/services/{id}/rotate-key` endpoint.
 
-**Webhook security:** Payloads signed with HMAC (shared secret per subscription). Consuming services must verify the signature before trusting the payload.
+**Role-based access:** The `services.role` field (`service` vs `admin`) controls what operations are allowed. Only `admin` role services can generate production tokens via the Auth Center. Consider expanding to finer-grained RBAC in future iterations.
 
-**Audit trail:** Every mutation logged with admin identity and timestamp.
+**Webhook security:** Payloads signed with HMAC-SHA256 (shared secret per subscription). Consuming services must verify the `signature` header before trusting the payload. Secrets should be rotated periodically.
 
-**Input validation:** Config keys and values validated. ES index names checked against allowlist patterns.
+**Audit trail:** Every mutation logged with the authenticated `service_id` and timestamp. Before/after state snapshots enable forensic investigation.
+
+**Input validation:** Config keys and values validated. ES index names checked against allowlist patterns. JSONB config values validated against optional schema if defined.
 
 ### Network
 
-**Auth Center:** `/auth/token` is customer-facing (may be public). `/auth/verify` and Admin API should be internal-only.
+**Auth Center:** `/preprod/auth/token` is customer-facing (may be public, behind LDAP). `/prod/auth/token`, `/auth/verify`, and Admin API should be internal-only.
 
-**Config Center:** All endpoints should be internal-only. No customer-facing exposure.
+**Config Center:** All endpoints should be internal-only. No customer-facing exposure. The Auth Center → Config Center validation call (`/auth/validate`) must use mutual TLS or be restricted to internal network.
 
 ---
 
@@ -922,23 +1205,36 @@ class AuthCenterAuth:
 
 ### Auth Center Metrics
 
-- `auth.token.issued` — tokens issued (by client_app_id)
-- `auth.token.failed` — failed auth attempts (critical for detecting brute force)
-- `auth.verify.count` — verify calls (by result: success/expired/revoked)
+- `auth.preprod.token.issued` — preprod tokens issued (by client_app_id)
+- `auth.preprod.token.failed` — failed LDAP auth attempts (by username)
+- `auth.prod.token.issued` — prod tokens issued (by admin service_id, client_app_id)
+- `auth.prod.token.failed` — failed admin auth attempts (by service_id)
+- `auth.ldap.latency_ms` — LDAP authentication latency (p50, p95, p99)
+- `auth.ldap.errors` — LDAP connection failures or timeouts
+- `auth.verify.count` — verify calls (by result: success/expired/revoked, by environment)
 - `auth.verify.latency_ms` — p50, p95, p99
-- `auth.revoke.count` — token revocations
+- `auth.revoke.count` — token revocations (by environment)
+- `auth.config_center.validate.latency_ms` — latency of admin credential validation via Config Center
+- `auth.config_center.validate.errors` — Config Center unreachable during admin validation
 
 ### Config Center Metrics
 
-- `config.lookup.count` — lookup calls (by namespace)
+- `config.auth.validate.count` — service credential validations (by service_id, by result)
+- `config.auth.validate.failed` — failed service authentication attempts
+- `config.lookup.count` — lookup calls (by namespace, by service_id)
 - `config.cache.hit_rate` — server-side cache hit ratio (target: >90%)
 - `config.webhook.dispatched` — webhooks sent (by namespace)
 - `config.webhook.failed` — webhook delivery failures (needs retry/alerting)
+- `admin.services.count` — registered services (gauge, by role)
 - `admin.mutation.count` — write operations (by entity type and action)
 
 ### Alerts
 
-- Elevated `auth.token.failed` → possible brute-force attack or misconfigured credentials.
+- Elevated `auth.preprod.token.failed` → possible brute-force via LDAP or misconfigured credentials.
+- Elevated `auth.prod.token.failed` → possible brute-force on admin endpoint or compromised service_key.
+- `auth.ldap.errors` sustained → LDAP server may be down; preprod token issuance will fail.
+- `auth.config_center.validate.errors` sustained → Config Center unreachable; prod token issuance will fail.
+- Elevated `config.auth.validate.failed` → possible brute-force on service authentication or leaked service_key.
 - Elevated 401 rates on verify → expired tokens, revoked clients, or clock skew.
 - `config.webhook.failed` sustained → a consuming service's webhook endpoint is down; config changes won't propagate.
 - Database connection failures on either service → immediate alert.
@@ -947,49 +1243,58 @@ class AuthCenterAuth:
 
 ## 15. Migration Plan
 
-### Phase 1: Build Auth Center (Week 1–2)
+### Phase 1: Build Config Center (Week 1–2)
 
-- Set up project, database schema, Alembic migrations.
-- Implement JWT signing, `/auth/token`, `/auth/verify`, `/auth/revoke`, JWKS endpoint.
-- Implement Admin API (clients, credentials).
+- Set up project, database schema (`services`, `namespaces`, `client_configs`, `subscriptions`, `audit_log`), Alembic migrations.
+- Implement service authentication middleware (`service_id` + `service_key` Basic Auth).
+- Implement `/auth/validate` endpoint (used by Auth Center for admin credential validation).
+- Implement `/config/lookup`, subscription/webhook system, Admin API (services CRUD, namespaces, configs).
 - Write unit and integration tests.
-- Register all existing clients and generate credentials.
+- Register the `indexing-hub` service and `admin-platform` admin service.
+- Register the `indexing-hub` namespace and seed existing client-to-index mappings.
 
-### Phase 2: Build Config Center (Week 2–3)
+### Phase 2: Build Auth Center (Week 2–3)
 
-- Set up project, database schema, Alembic migrations.
-- Implement `/config/lookup`, subscription/webhook system, Admin API.
-- Write unit and integration tests.
-- Register the `indexing-hub` namespace.
-- Seed all existing hardcoded client-to-index mappings.
+- Set up project, database schema (`clients`, `issued_tokens`), Alembic migrations.
+- Integrate LDAP client (ldap3 or similar) for preprod pre-authentication.
+- Implement preprod token issuance (`/preprod/auth/token` — LDAP-gated).
+- Implement prod token issuance (`/prod/auth/token` — Basic Auth, validates admin creds via Config Center's `/auth/validate`).
+- Implement `/auth/verify`, `/auth/revoke`, JWKS endpoint.
+- Implement Admin API (clients CRUD, token listing).
+- Store all issued tokens in `issued_tokens` table.
+- Write unit and integration tests. Mock LDAP and Config Center for unit tests; use real services for integration tests.
+- Register all existing clients (with `server_application` set).
 
 ### Phase 3: Dual-Mode in Indexing Hub (Week 4)
 
-- Integrate Auth Center SDK and Config Center SDK.
+- Register the Indexing Hub as a service in Config Center (get `service_id` + `service_key`).
+- Integrate Auth Center SDK (`AuthCenterClient`) and Config Center SDK (`ConfigCenterClient` with `service_id` + `service_key`).
 - Run in **dual-mode**: accept both external auth tokens AND Auth Center JWTs.
-- Config lookup checks Config Center first, falls back to hardcoded values.
+- Config lookup checks Config Center first (authenticated), falls back to hardcoded values.
 - Log all requests, noting which auth + config path was used.
 - Subscribe to Config Center webhooks.
-- Deploy to staging and validate.
+- Deploy to staging and validate both preprod and prod token flows end-to-end.
 
 ### Phase 4: Customer Migration (Week 5–6)
 
-- Distribute new credentials to all customers.
-- Customers switch to Auth Center for token generation.
-- Monitor dual-mode logs — track migration progress.
+- Provide customers with LDAP login instructions and preprod token generation guide.
+- Customers switch to Auth Center (`/preprod/auth/token`) for token generation.
+- Admins switch to Auth Center (`/prod/auth/token`) using their `service_id` + `service_key`.
+- Monitor dual-mode logs — track migration progress by environment.
 - Provide support during transition.
 
 ### Phase 5: Cut Over (Week 7)
 
 - Remove external auth support and hardcoded mappings from Indexing Hub.
 - Decommission external auth provider dependency.
-- Update documentation and runbooks.
+- Update documentation, runbooks, and SDK guides.
 - Communicate completion to stakeholders.
 
 ### Phase 6: Onboard Additional Services (Ongoing)
 
-- New services register a namespace in Config Center and integrate via SDKs.
-- No changes to Auth Center or Config Center needed.
+- New services register as a service in Config Center (`POST /admin/services`) to get `service_id` + `service_key`.
+- Register a namespace, add client configs, subscribe to webhooks.
+- Integrate via SDKs. No changes to Auth Center or Config Center code needed.
 
 ---
 
@@ -1003,4 +1308,10 @@ After Phase 5, the dual-mode code can be restored from the last commit before cu
 
 ## 17. Summary
 
-This design splits the system into two independent, centralized services. The **Auth Center** fully replaces the external auth provider — it owns client registration, credential management, JWT issuance, verification, and revocation. The **Config Center** owns namespace-scoped client configuration — consuming services subscribe to it for config changes and can update mappings via its Admin API. The two services share `client_app_id` as a common key but have no runtime dependency on each other. The Indexing Hub is the first consumer, but any future service follows the same pattern: verify the JWT with the Auth Center, fetch config from the Config Center. The migration is phased over ~7 weeks with a dual-mode safety net, and both services are designed to be independently deployable, scalable, and operationally simple.
+This design splits the system into two independent, centralized services with a specific cross-dependency for production auth.
+
+The **Auth Center** fully replaces the external auth provider. It supports dual-environment token issuance: preprod tokens are gated by LDAP pre-authentication (customer self-service), while prod tokens are gated by admin Basic Auth (`service_id` + `service_key`) validated against the Config Center. All issued tokens are persisted in the database for audit and revocation tracking. The Auth Center owns client registration, JWT issuance, verification, and revocation.
+
+The **Config Center** owns namespace-scoped client configuration and **service authentication**. Every consuming service and admin registers with a `service_id` + `service_key` — this is how they authenticate to the Config Center and how the Auth Center validates admin credentials for prod token issuance. Consuming services subscribe to config change webhooks and maintain a local cache for performance. Config updates are made via the Admin API with no redeployment needed.
+
+The two services share `client_app_id` as the common key linking identity to configuration. The Indexing Hub is the first consumer, but any future service follows the same pattern: register as a service in Config Center, verify JWTs with the Auth Center, fetch config from the Config Center (authenticated with `service_id` + `service_key`). The migration is phased over ~7 weeks with a dual-mode safety net, and both services are designed to be independently deployable, scalable, and operationally simple.
