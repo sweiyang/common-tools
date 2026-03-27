@@ -19,10 +19,11 @@
 9. [Full Platform Architecture (Detailed)](#9-full-platform-architecture-detailed)
 10. [Proposal A: Reusable Workflow Orchestrator](#10-proposal-a-reusable-workflow-orchestrator)
 11. [Proposal B: Compiled Agent](#11-proposal-b-compiled-agent)
-12. [Proposal Comparison: A vs B](#12-proposal-comparison-a-vs-b)
-13. [Deep Dive: Workflow Engine](#13-deep-dive-workflow-engine)
-14. [Deep Dive: State & Memory](#14-deep-dive-state--memory)
-15. [Recommendations & Next Steps](#15-recommendations--next-steps)
+12. [Proposal C: Embedded Engine SDK](#12-proposal-c-embedded-engine-sdk-team-owned-agent-d)
+13. [Proposal Comparison: A vs B vs C](#13-proposal-comparison-a-vs-b-vs-c)
+14. [Deep Dive: Workflow Engine](#14-deep-dive-workflow-engine)
+15. [Deep Dive: State & Memory](#15-deep-dive-state--memory)
+16. [Recommendations & Next Steps](#16-recommendations--next-steps)
 
 ---
 
@@ -624,66 +625,376 @@ flowchart TB
 
 ---
 
-## 12. Proposal Comparison: A vs B
+## 12. Proposal C: Embedded Engine SDK (Team-Owned Agent D)
 
-### Side-by-Side Comparison
+### Concept
 
-| Dimension | Proposal A: Workflow Orchestrator | Proposal B: Compiled Agent |
-|-----------|----------------------------------|---------------------------|
-| **Runtime model** | Engine steps through agents at runtime | Single pre-compiled unit executes internally |
-| **Caller experience** | Call a workflow, engine manages the chain | Call Agent D, no awareness of internals |
-| **Latency** | Higher — inter-service hops between each step | Lower — agents are co-located or inlined |
-| **Failure recovery** | Strong — State Manager persists after each step, resume from failure point | Requires internal checkpointing built into Agent D |
-| **Observability** | Natural per-step tracing via engine | Needs compiler-injected OTel span boundaries |
-| **Hot-swap agents** | Trivial — change registry pointer, next run picks it up | Requires recompilation and redeployment of Agent D |
-| **Versioning** | Workflow def + agent versions are independently managed | Agent D version encapsulates all sub-agent versions |
-| **Composability** | Workflows reference agents, but workflows can't be used as agents | Agent D registers itself — recursive composition (D can be a step in E) |
-| **Debugging** | Inspect engine state at each step boundary | Must look inside Agent D's internal trace |
-| **Scaling** | Each agent scales independently | Agent D scales as one unit (may over/under-provision for individual steps) |
-| **Deployment complexity** | Engine is shared infra, agents deploy independently | Each compiled agent is a separate deployment |
-| **Aligns with DeepMind research** | Multi-hop sequential execution (slower) | Single agent boundary for sequential tasks (recommended) |
+The consuming team builds and deploys their own **Agent D** using an **Embedded Workflow Engine SDK** provided by the central platform. Agent D is a custom agent that the team writes, owns, and deploys — but internally it uses the platform's SDK to discover agents from the registry, chain them via A2A, and get built-in checkpointing, guardrails, and observability.
+
+Think of it as: every custom agent ships with its own micro-engine. The platform provides the engine as a library, not as shared infrastructure.
+
+This creates three sub-variants depending on how much the SDK abstracts away:
+
+- **C1 (Thin SDK):** Team writes their own orchestration code. SDK provides helpers for A2A calls, MCP tool access, and retry. Team wires the chain logic.
+- **C2 (Medium SDK):** SDK handles A2A calls, I/O validation, state, and checkpointing. Team declares step order and input/output mappings in code.
+- **C3 (Thick SDK):** Full engine embedded as a library. Team declares steps declaratively in code (similar to YAML but in Python/TS). SDK handles everything.
+
+### Architecture Diagram
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E8F4FD', 'primaryTextColor': '#1A1A2E', 'lineColor': '#6366F1', 'background': '#FFFFFF', 'fontFamily': 'Segoe UI, sans-serif', 'fontSize': '14px', 'clusterBkg': '#F8FAFC', 'clusterBorder': '#CBD5E1' }}}%%
+
+flowchart TB
+    subgraph PLATFORM["🏢 Central Platform Provides"]
+        direction LR
+        SDK["📦 Workflow Engine SDK\nA2A · MCP · State\nGuardrails · OTel"]
+        REGISTRY["📦 Agent Registry\nAgent Cards · Tool Bindings"]
+    end
+
+    subgraph TEAM["👥 Consuming Team Builds"]
+        direction TB
+        CODE["💻 Team's Code\nCustom Agent D\nimports SDK"]
+
+        subgraph AGENT_D["🤖 Agent D · Team-Owned Deployment"]
+            direction TB
+            ENTRY["Entrypoint\nCustom logic + routing"]
+
+            subgraph ENGINE["⚙️ Embedded Engine (from SDK)"]
+                direction LR
+                A["Agent A\nvia A2A"]
+                B["Agent B\nvia A2A"]
+                C["Agent C\nvia A2A"]
+            end
+
+            CUSTOM["Custom post-processing\nTeam-specific logic"]
+            EXIT["Response"]
+
+            ENTRY --> ENGINE
+            A -->|"A2A · output_A"| B -->|"A2A · output_B"| C
+            ENGINE --> CUSTOM --> EXIT
+        end
+    end
+
+    subgraph INGRESS["🌐 Request Ingress"]
+        direction TB
+        APIGW["API Gateway"]
+        subgraph SEC["🛡️ Gateway Security"]
+            direction LR
+            WAF["AWS WAF\nInjection Rules"]
+            SHIELD["Bedrock Guardrails\nContent Filter"]
+            AUTH["Cognito + IAM"]
+        end
+        APIGW --> WAF --> SHIELD --> AUTH
+    end
+
+    TOOLS["🔧 MCP Tool Servers"]
+    STATE["💾 State & Memory"]
+    OPS["📊 Observability & 🛡️ Governance"]
+
+    SDK -.->|"import"| CODE
+    REGISTRY -.->|"discover agents"| ENGINE
+    CODE --> AGENT_D
+    INGRESS -->|"Call Agent D"| AGENT_D
+    A <-->|"MCP"| TOOLS
+    B <-->|"MCP"| TOOLS
+    C <-->|"MCP"| TOOLS
+    AGENT_D --> STATE
+    AGENT_D -.-> OPS
+    AGENT_D -.->|"Register D"| REGISTRY
+
+    classDef platform fill:#E3F2FD,stroke:#1565C0,color:#0D47A1,stroke-width:2px
+    classDef team fill:#FFF8E1,stroke:#F57F17,color:#E65100,stroke-width:2px
+    classDef ingress fill:#FFF3E0,stroke:#E65100,color:#BF360C,stroke-width:2px
+    classDef security fill:#FFEBEE,stroke:#C62828,color:#B71C1C,stroke-width:2px
+    classDef agent fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20,stroke-width:2px
+    classDef tool fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C,stroke-width:2px
+    classDef state fill:#E0F7FA,stroke:#00838F,color:#006064,stroke-width:2px
+    classDef ops fill:#FBE9E7,stroke:#BF360C,color:#BF360C,stroke-width:2px
+
+    class SDK,REGISTRY platform
+    class CODE,ENTRY,CUSTOM team
+    class APIGW ingress
+    class WAF,SHIELD,AUTH security
+    class A,B,C,EXIT agent
+    class TOOLS tool
+    class STATE state
+    class OPS ops
+```
+
+### Request Flow
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E8F4FD', 'primaryTextColor': '#1A1A2E', 'lineColor': '#6366F1', 'background': '#FFFFFF', 'fontFamily': 'Segoe UI, sans-serif', 'fontSize': '13px' }}}%%
+
+sequenceDiagram
+    participant DEV as Consuming Team
+    participant SDK as Platform SDK
+    participant AR as Agent Registry
+    participant EKS as EKS Cluster
+
+    Note over DEV,EKS: Build Time (team-owned)
+    DEV->>SDK: import workflow_engine_sdk
+    DEV->>DEV: Write Agent D code using SDK
+    DEV->>AR: Register Agent D
+    DEV->>EKS: Deploy Agent D (team-owned CI/CD)
+
+    participant U as User / Client
+    participant GW as API Gateway + WAF + Guardrails
+    participant D as Agent D (team-owned)
+    participant A as Agent A (via A2A)
+    participant B as Agent B (via A2A)
+    participant C as Agent C (via A2A)
+    participant T as MCP Tools
+
+    Note over U,T: Runtime
+    U->>GW: POST /agents/agent-d/run
+    GW->>GW: WAF → Guardrails → Auth
+    GW->>D: Sanitized payload
+
+    D->>D: Custom pre-processing
+    D->>AR: SDK resolves agent endpoints
+    AR-->>D: Agent A, B, C endpoints
+
+    D->>A: A2A Task (payload)
+    A->>T: MCP calls
+    T-->>A: Results
+    A-->>D: output_A
+
+    D->>B: A2A Task (output_A)
+    B->>T: MCP calls
+    T-->>B: Results
+    B-->>D: output_B
+
+    D->>C: A2A Task (output_B)
+    C->>T: MCP calls
+    T-->>C: Results
+    C-->>D: output_C
+
+    D->>D: Custom post-processing
+    D-->>GW: final_output
+    GW-->>U: Response
+```
+
+### Example Code (C2 — Medium SDK)
+
+```python
+from platform_sdk import WorkflowEngine, step, agent_call
+
+class CreditRiskAgent:
+    def __init__(self):
+        self.engine = WorkflowEngine(
+            name="credit-risk-review",
+            checkpoint_store="dynamodb",
+            otel_enabled=True
+        )
+
+    @step(timeout=60, retry=2)
+    async def extract(self, payload):
+        return await agent_call("data-extractor@v2", payload)  # A2A
+
+    @step(timeout=120, retry=2)
+    async def analyze(self, extracted_data):
+        return await agent_call("risk-analyzer@v3", extracted_data)  # A2A
+
+    @step(timeout=60, retry=1)
+    async def report(self, analysis):
+        result = await agent_call("report-generator@v1", analysis)  # A2A
+        # Custom post-processing (team-specific)
+        result["reviewed_by"] = "credit-risk-team"
+        result["timestamp"] = datetime.utcnow()
+        return result
+
+    async def run(self, payload):
+        return await self.engine.execute([
+            self.extract,
+            self.analyze,
+            self.report
+        ], payload)
+```
+
+### Sub-Variant Comparison: C1 vs C2 vs C3
+
+#### Dimension 1: Who Wires the Chain Logic?
+
+| | C1: Team writes code | C2: Team configures via SDK | C3: Team declares, SDK auto-wires |
+|---|---|---|---|
+| **How it works** | Team writes raw A2A calls, if/else, error handling manually. SDK provides client helpers. | Team uses `@step` decorators and `agent_call()`. SDK handles A2A protocol, retry, checkpoints. | Team provides a step list (like YAML but in code). SDK resolves agents, validates contracts, wires everything. |
+| **Pros** | Maximum flexibility. Team can add conditional logic, custom branching, parallel fan-out, anything. No abstraction leaks. | Good balance — team controls step order and can inject custom logic between steps, but doesn't deal with A2A plumbing. | Lowest effort for team. Almost no boilerplate. Consistent patterns across all teams. |
+| **Cons** | High effort per team. Every team rebuilds retry, checkpointing, observability. Inconsistent patterns across org. | Some flexibility lost — custom branching requires breaking out of the decorator pattern. | Least flexible. Can't easily add custom logic between steps. If the SDK doesn't support a pattern, team is stuck. |
+| **Best for** | Teams with complex, non-linear workflows that need full control. | Most internal teams — standard sequential chains with occasional custom logic. | Simple chains where speed of delivery matters more than customization. |
+
+#### Dimension 2: Who Builds & Deploys Agent D?
+
+| | Team builds + deploys | Central platform deploys for them | Team builds, registers with central platform |
+|---|---|---|---|
+| **How it works** | Team owns the full CI/CD pipeline. They import the SDK, write Agent D, build a container, deploy to their own EKS namespace. | Team provides config (YAML or code). Central platform compiles, containerizes, and deploys Agent D. Team has no deployment responsibility. | Team writes and builds Agent D. Before deploying, they must register with the platform (schema validation, security scan, policy check). |
+| **Pros** | Full ownership and autonomy. Team controls release cadence, canary rollouts, rollback. No dependency on platform team's deployment pipeline. | Zero DevOps burden on consuming teams. Guaranteed consistent deployment patterns. Platform team can enforce infra standards. | Teams retain autonomy while platform ensures governance. Registration acts as a quality gate — no unregistered agents in production. |
+| **Cons** | Platform team has limited visibility into deployments. Risk of inconsistent infra patterns, security misconfigurations, ungoverned agents. | Teams lose deployment autonomy. Platform team becomes a bottleneck. "Throw config over the wall" dynamic — hard to debug when something goes wrong. | Registration process adds friction. Teams may resist the governance overhead. Need to design the registration gate carefully to avoid it becoming a bottleneck. |
+| **Best for** | Mature teams with strong DevOps practices who need fast iteration. | Teams without DevOps capability, or when strict infra standardization is required. | Most organizations — balances autonomy with governance. This is the recommended default. |
+
+#### Dimension 3: How Much Does the Embedded Engine Abstract?
+
+| | Thin: helpers only | Medium: SDK handles plumbing | Thick: full engine as library |
+|---|---|---|---|
+| **What SDK provides** | A2A client, MCP client, retry util, OTel trace helper. Team writes the glue. | A2A calls, I/O schema validation, checkpointing, OTel spans, budget enforcement. Team defines step order. | Complete engine: step resolution, sequencing, checkpointing, guardrails, observability. Team just declares steps. |
+| **Lines of team code** | High (~200+ lines for a 3-step chain) | Medium (~50–80 lines) | Low (~20–30 lines) |
+| **Pros** | No magic. Team understands exactly what's happening. Easy to debug. No abstraction leaks. | Sweet spot — eliminates boilerplate while keeping team in control of flow. Consistent observability and checkpointing across all agents. | Fastest time-to-delivery. Guaranteed consistency. Platform team can upgrade the engine SDK and all agents benefit. |
+| **Cons** | Every team reinvents retry, checkpointing, observability. Inconsistent quality across teams. High maintenance burden. | Team must learn the SDK's patterns and conventions. Some lock-in to the SDK's abstractions. | Hardest to debug when something goes wrong inside the engine. Abstraction leaks are painful. SDK upgrades can break teams if API changes. |
+| **Upgrade story** | No centralized upgrade path — each team manages their own. | SDK upgrade = team bumps dependency version. Engine improvements propagate automatically. | Same as medium, but higher risk — engine is doing more, so breaking changes are more impactful. |
+| **Best for** | Platform teams or advanced teams building non-standard patterns. | Most internal teams — the recommended default. | Teams that want maximum speed and are okay with less control. |
+
+---
+
+## 13. Proposal Comparison: A vs B vs C
+
+### Three Proposals at a Glance
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E8F4FD', 'primaryTextColor': '#1A1A2E', 'lineColor': '#6366F1', 'background': '#FFFFFF', 'fontFamily': 'Segoe UI, sans-serif', 'fontSize': '14px', 'clusterBkg': '#F8FAFC', 'clusterBorder': '#CBD5E1' }}}%%
+
+flowchart LR
+    subgraph PA["Proposal A\nCentralized Orchestrator"]
+        direction TB
+        PA_EN["⚙️ Shared Engine"]
+        PA_A["A"] --> PA_B["B"] --> PA_C["C"]
+        PA_EN -->|"steps through"| PA_A
+    end
+
+    subgraph PB["Proposal B\nCompiled Agent"]
+        direction TB
+        PB_COMP["🔨 Compiler"]
+        subgraph PB_D["🤖 Agent D"]
+            PB_A["A"] --> PB_B["B"] --> PB_C["C"]
+        end
+        PB_COMP -->|"emits"| PB_D
+    end
+
+    subgraph PC["Proposal C\nEmbedded Engine SDK"]
+        direction TB
+        PC_SDK["📦 SDK"]
+        subgraph PC_D["🤖 Agent D (team-owned)"]
+            PC_EN["⚙️ Embedded Engine"]
+            PC_A["A"] --> PC_B["B"] --> PC_C["C"]
+            PC_EN -->|"drives"| PC_A
+        end
+        PC_SDK -.->|"imported by"| PC_D
+    end
+
+    style PA_EN fill:#FFF8E1,stroke:#F57F17,color:#E65100,stroke-width:2px
+    style PB_COMP fill:#FCE4EC,stroke:#AD1457,color:#880E4F,stroke-width:2px
+    style PC_SDK fill:#E3F2FD,stroke:#1565C0,color:#0D47A1,stroke-width:2px
+    style PC_EN fill:#FFF8E1,stroke:#F57F17,color:#E65100,stroke-width:2px
+
+    style PA_A fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PA_B fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PA_C fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PB_A fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PB_B fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PB_C fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PC_A fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PC_B fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style PC_C fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+```
+
+### Full Comparison Matrix
+
+| Dimension | A: Centralized Orchestrator | B: Compiled Agent | C: Embedded Engine SDK |
+|-----------|---------------------------|-------------------|----------------------|
+| **Who defines the workflow** | YAML/JSON DSL | YAML/JSON DSL | Code (using SDK) |
+| **Who owns the engine** | Central platform (shared infra) | Compiler absorbs engine at build time | Team owns it (engine is a library) |
+| **Who deploys Agent D** | N/A — engine calls agents directly | Central platform compiles + deploys | Team builds + deploys |
+| **Runtime model** | Engine steps through agents per-request | Single pre-compiled unit | Team's agent with embedded engine |
+| **Caller experience** | Call a workflow endpoint | Call Agent D endpoint | Call Agent D endpoint |
+| **Latency** | Highest (inter-service hops per step) | Lowest (co-located) | Medium (A2A calls but from one process) |
+| **Failure recovery** | Built-in (engine persists per-step) | Needs compiler-injected checkpoints | SDK provides checkpointing |
+| **Hot-swap agents** | Trivial (registry pointer change) | Requires recompile + redeploy | Team redeploys with updated SDK call |
+| **Composability** | Workflows ≠ agents | Agent D is reusable (recursive) | Agent D is reusable (recursive) |
+| **Custom logic between steps** | Not possible (YAML is declarative) | Not possible (compiler wires it) | Full flexibility (team writes code) |
+| **Observability** | Natural (engine owns tracing) | Compiler-injected OTel spans | SDK-provided OTel spans |
+| **Scaling** | Per-agent independent | All-or-nothing per compiled unit | All-or-nothing per Agent D |
+| **Team autonomy** | Low (platform controls everything) | Low (platform compiles + deploys) | High (team owns build + deploy) |
+| **Platform control** | High (engine is centralized) | High (compiler enforces standards) | Medium (SDK enforces patterns, but team can diverge) |
+| **Governance** | Strong (single enforcement point) | Strong (compile-time validation) | Moderate (SDK conventions + registration gate) |
+| **Onboarding effort** | Low (just write YAML) | Low (just write YAML) | Medium (learn SDK, write code) |
+| **DeepMind alignment** | Multi-hop (weaker for sequential) | Single boundary (recommended) | Single boundary (recommended) |
 
 ### Pros & Cons Summary
 
-**Proposal A — Workflow Orchestrator**
+**Proposal A — Centralized Workflow Orchestrator**
 
 Pros:
-- Strongest failure recovery: per-step checkpointing and resume is built into the architecture, not bolted on.
-- Easiest to debug: inspect engine state at any step boundary; each step has natural OTel spans.
-- Zero-downtime agent updates: swap an agent version in the registry, next workflow run picks it up automatically.
-- Independent scaling: if Agent B is the bottleneck, scale B alone without touching A or C.
-- Lower deployment complexity per agent: agents don't need to know about each other.
+- Strongest failure recovery — per-step checkpointing built into architecture.
+- Easiest to debug — inspect engine state at any step boundary.
+- Zero-downtime agent updates — swap registry pointer, next run picks it up.
+- Independent per-agent scaling.
+- Lowest onboarding effort — teams just write YAML.
 
 Cons:
-- Higher latency from inter-service hops between each sequential step.
-- Shared workflow engine is a potential bottleneck and single point of failure.
-- Workflows can't be reused as agents — they're a different abstraction.
-- More moving parts at runtime (engine + state manager + sequencer).
-- Goes against DeepMind's finding that single-agent boundaries perform best for sequential tasks.
+- Highest latency — inter-service hops between every step.
+- Shared engine is a bottleneck and single point of failure.
+- No custom logic between steps — YAML is declarative only.
+- Workflows can't be reused as agents.
+- Weakest DeepMind alignment for sequential tasks.
 
 **Proposal B — Compiled Agent**
 
 Pros:
-- Lower latency: no inter-service hops, agents are co-located within one boundary.
-- Recursive composability: Agent D registers as a reusable agent, so D can become a step in another workflow.
-- Aligns with DeepMind's scaling research: presents as a single agent for sequential reasoning.
-- Simpler runtime: no shared orchestrator in the hot path.
-- Cleaner API: callers see one agent, one endpoint, one contract.
+- Lowest latency — agents co-located in one unit.
+- Recursive composability — Agent D is itself a reusable agent.
+- Strongest DeepMind alignment — single agent boundary.
+- Cleanest caller API — one endpoint, one contract.
+- Compile-time validation catches contract mismatches early.
 
 Cons:
-- Failure recovery requires the compiler to inject internal checkpointing — more complexity at build time.
-- Observability requires compiler-injected OTel span boundaries between internal steps.
-- Agent updates require recompilation and redeployment — need a CI/CD pipeline that detects dependency changes.
-- Scaling is all-or-nothing for the compiled unit; can't scale individual steps independently.
-- Debugging is harder: must look inside Agent D's internal execution trace.
+- No custom logic between steps — compiler wires a fixed chain.
+- Agent updates require recompile + redeploy.
+- Debugging requires looking inside compiled Agent D's trace.
+- All-or-nothing scaling per compiled unit.
+- Teams have no ownership — platform controls everything.
+
+**Proposal C — Embedded Engine SDK**
+
+Pros:
+- Full flexibility for custom logic between steps (pre/post-processing, conditional routing, data transformation).
+- Team ownership — teams control their deployment cadence, canary rollouts, and rollback.
+- Recursive composability — Agent D registers back to the registry.
+- SDK upgrades propagate consistency improvements to all teams.
+- Best fit for diverse team needs — each team can customize while sharing common plumbing.
+
+Cons:
+- Higher onboarding effort — teams must learn the SDK and write code.
+- Risk of divergence — teams may misuse or bypass SDK patterns.
+- Governance is harder to enforce — SDK conventions are easier to violate than compile-time or engine-level controls.
+- SDK versioning adds dependency management complexity across many teams.
+- Teams need DevOps capability to build and deploy their own agents.
+
+### When to Use Which
+
+| Scenario | Best Proposal |
+|----------|--------------|
+| Simple, standardized chains (e.g., ETL-style: extract → transform → load) | **A** — just YAML, platform handles everything |
+| Performance-critical sequential pipelines with no custom logic | **B** — lowest latency, single boundary |
+| Teams that need custom logic between agent steps (validation, enrichment, routing) | **C** — full code control with SDK guardrails |
+| Teams without DevOps capability | **A or B** — no deployment responsibility |
+| Mature teams wanting full ownership and fast iteration | **C** — team owns the full lifecycle |
+| Maximum governance and compliance control | **A** — single enforcement point |
+| Recursive composition (agents made of agents made of agents) | **B or C** — both register Agent D back to registry |
 
 ### Recommendation
 
-Use a **hybrid approach**: Compiled Agent as the default with compiler-injected checkpointing and OTel boundaries. The compiler acts as the smart layer that produces optimized, single-unit agents while preserving the operational benefits of the orchestrator model. When a sub-agent is updated in the registry, the platform detects the dependency change and triggers recompilation — similar to Docker image rebuilds when base layers change.
+The three proposals are not mutually exclusive — they serve different personas and use cases within the same platform.
+
+**Offer all three, with C2 (Medium SDK) as the primary path:**
+
+1. **Proposal A** as the "easy mode" for teams that just want to declare a chain in YAML without writing code. Good for simple, governance-heavy workflows.
+2. **Proposal C (C2 variant)** as the "standard mode" for most internal teams. Medium SDK balances flexibility with consistency. Teams write code, own deployments, but get checkpointing, A2A, OTel, and guardrails for free.
+3. **Proposal B** as an optimization layer — when a Proposal A or C workflow proves stable and performance-critical, the platform can compile it into a single unit for lower latency.
+
+This is analogous to how Kubernetes offers Deployments (declarative), Operators (SDK-driven), and static Pods (compiled) — different abstraction levels for different needs, all on the same platform.
 
 ---
 
-## 13. Deep Dive: Workflow Engine
+## 14. Deep Dive: Workflow Engine
 
 The Workflow Engine is the central orchestration component in Proposal A. In Proposal B, its logic is absorbed by the Compiler at build time. Understanding its internals is critical for either approach.
 
@@ -736,7 +1047,7 @@ The key difference: in Proposal A, the engine is shared infrastructure serving m
 
 ---
 
-## 14. Deep Dive: State & Memory
+## 15. Deep Dive: State & Memory
 
 State management in agent systems operates across four distinct layers, each serving a different purpose and requiring different storage characteristics.
 
@@ -863,11 +1174,17 @@ Working Memory, Session Memory, and Long-Term Knowledge behave identically in bo
 
 ---
 
-## 15. Recommendations & Next Steps
+## 16. Recommendations & Next Steps
 
 ### Architecture Decision
 
-Adopt the **hybrid approach**: Compiled Agent (Proposal B) as the default execution model, with the Compiler using Temporal as the internal durable execution backbone. This gives you single-agent boundary performance (aligned with DeepMind findings), recursive composability (Agent D as a building block), and durable checkpointing + replay without building custom state management.
+Offer all three proposals as different abstraction levels on the same platform, with **Proposal C (C2 Medium SDK)** as the primary recommended path for most internal teams:
+
+- **Proposal A** as "easy mode" — teams write YAML, platform handles everything. Best for simple chains and governance-heavy workflows.
+- **Proposal C2** as "standard mode" — teams write code using the SDK, own their deployment. Best balance of flexibility, consistency, and team autonomy.
+- **Proposal B** as an "optimization layer" — when a workflow proves stable and performance-critical, compile it into a single unit for lower latency.
+
+This is analogous to Kubernetes offering Deployments (declarative), Operators (SDK-driven), and static Pods (compiled) — different levels for different needs.
 
 ### Immediate Actions
 
