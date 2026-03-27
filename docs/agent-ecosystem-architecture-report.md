@@ -321,11 +321,49 @@ flowchart TB
 
 ---
 
+### API Gateway vs Agent Load Balancer: Two Different Jobs
+
+A common question is whether the API Gateway handles agent load balancing. It does not — they solve different problems at different layers.
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'background': '#FFFFFF', 'fontFamily': 'Segoe UI, sans-serif', 'fontSize': '14px', 'clusterBkg': '#F8FAFC', 'clusterBorder': '#CBD5E1' }}}%%
+
+flowchart LR
+    subgraph EDGE["Edge Layer"]
+        GW["🌐 API Gateway\nRoute HTTP requests\nWAF · Guardrails · Auth\nRate limiting · API keys"]
+    end
+
+    subgraph INTERNAL["Internal Layer"]
+        LB["⚖️ Agent Load Balancer\nRoute A2A calls to agent instances\nHealth-aware · Version-aware\nCircuit breaker · Spend governor"]
+    end
+
+    CLIENT["Client"] --> GW
+    GW -->|"HTTP"| ORCHESTRATOR["Engine / Agent D"]
+    ORCHESTRATOR -->|"A2A"| LB
+    LB --> INST1["Agent B\ninstance 1"]
+    LB --> INST2["Agent B\ninstance 2"]
+    LB --> INST3["Agent B\ninstance 3"]
+
+    style GW fill:#FFF3E0,stroke:#E65100,color:#BF360C,stroke-width:2px
+    style LB fill:#FFF8E1,stroke:#F57F17,color:#E65100,stroke-width:2px
+    style INST1 fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style INST2 fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+    style INST3 fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20
+```
+
+**API Gateway** is the edge: it routes incoming HTTP requests, enforces WAF/Guardrails/Auth, handles rate limiting and API keys. It knows URLs and routes. It does not understand agent semantics.
+
+**Agent Load Balancer** is internal: it routes A2A calls from the orchestrator (or compiled Agent D, or SDK) to healthy agent instances. It understands agent versions (route to `risk-analyzer@v3` not `@v2`), health status (skip unhealthy pods), circuit breaking (detect cascading failure), and spend governance (per-agent cost caps). In practice, this can be implemented as an internal ALB with custom routing rules, a K8s Service with health-aware endpoints, or a service mesh sidecar (Istio/Linkerd) — the key point is that it sits between whoever is making A2A calls and the actual agent fleet.
+
+The Workflow Engine (Proposal A) picks *which agent* to call. The Agent LB picks *which instance* of that agent to route to.
+
+---
+
 ## 10. Proposal A: Reusable Workflow Orchestrator
 
 ### Concept
 
-A **Workflow Engine** sits between the API Gateway and Agent Runtime. Users define workflows in YAML/JSON DSL. At runtime, the engine fetches the definition, resolves agents from the registry, and steps through them sequentially, passing each agent's output as the next agent's input via A2A.
+A **Workflow Engine** sits between the API Gateway and Agent Runtime. Users define workflows in YAML/JSON DSL. At runtime, the engine fetches the definition, resolves agents from the registry, and steps through them sequentially, passing each agent's output as the next agent's input via A2A. Each A2A call passes through the **Agent Load Balancer** for instance-level routing.
 
 ### Request Flow
 
@@ -418,6 +456,12 @@ flowchart TB
         GUARDRAIL["Guardrails · I/O validation + budget"]
     end
 
+    subgraph AGENT_LB["⚖️ Agent Load Balancer"]
+        direction LR
+        LB_ROUTE["Instance Router<br/>Health-aware · Version-aware"]
+        LB_CB["Circuit Breaker<br/>Error amplification guard"]
+    end
+
     subgraph RUNTIME["🤖 Agent Runtime · EKS"]
         direction LR
         AGENT_A["Agent A<br/>Data Extractor"]
@@ -434,10 +478,13 @@ flowchart TB
     WF_STORE -.->|"4 · Fetch"| RESOLVER
     REGISTRY -.->|"5 · Resolve"| RESOLVER
     RESOLVER --> SEQUENCER
-    SEQUENCER -->|"6a · A2A"| AGENT_A
-    AGENT_A -->|"6b · A2A · output_A"| AGENT_B
-    AGENT_B -->|"6c · A2A · output_B"| AGENT_C
-    AGENT_C -->|"6d · final_output"| SEQUENCER
+    SEQUENCER -->|"6a · A2A"| AGENT_LB
+    AGENT_LB --> AGENT_A
+    AGENT_A -->|"output_A"| AGENT_LB
+    AGENT_LB -->|"6b · A2A"| AGENT_B
+    AGENT_B -->|"output_B"| AGENT_LB
+    AGENT_LB -->|"6c · A2A"| AGENT_C
+    AGENT_C -->|"final_output"| SEQUENCER
     AGENT_A <-->|"MCP"| TOOLS
     AGENT_B <-->|"MCP"| TOOLS
     AGENT_C <-->|"MCP"| TOOLS
@@ -449,6 +496,7 @@ flowchart TB
     classDef ingress fill:#FFF3E0,stroke:#E65100,color:#BF360C,stroke-width:2px
     classDef security fill:#FFEBEE,stroke:#C62828,color:#B71C1C,stroke-width:2px
     classDef engine fill:#FFF8E1,stroke:#F57F17,color:#E65100,stroke-width:2px
+    classDef lb fill:#FFF3E0,stroke:#EF6C00,color:#E65100,stroke-width:2px
     classDef agent fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20,stroke-width:2px
     classDef tool fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C,stroke-width:2px
 
@@ -457,6 +505,7 @@ flowchart TB
     class APIGW ingress
     class WAF,SHIELD,AUTH security
     class RESOLVER,SEQUENCER,STATE_MGR,GUARDRAIL engine
+    class LB_ROUTE,LB_CB lb
     class AGENT_A,AGENT_B,AGENT_C agent
     class TOOLS tool
 ```
@@ -589,6 +638,8 @@ flowchart TB
         ENTRY --> A -->|"A2A · output_A"| B -->|"A2A · output_B"| C --> EXIT
     end
 
+    AGENT_LB["⚖️ Agent LB\nInstance routing · Circuit breaker\nHealth-aware · Version-aware"]
+
     TOOLS["🔧 MCP Tool Servers"]
     STATE["💾 State & Memory"]
     OPS["📊 Observability & 🛡️ Governance"]
@@ -599,9 +650,10 @@ flowchart TB
     PARSE --> COMPOSE --> EMIT
     EMIT -->|"4 · Deploy"| AGENT_D
     INGRESS -->|"5 · Call"| AGENT_D
-    A <-->|"MCP"| TOOLS
-    B <-->|"MCP"| TOOLS
-    C <-->|"MCP"| TOOLS
+    A <-->|"A2A via LB"| AGENT_LB
+    B <-->|"A2A via LB"| AGENT_LB
+    C <-->|"A2A via LB"| AGENT_LB
+    AGENT_LB <-->|"MCP"| TOOLS
     AGENT_D --> STATE
     AGENT_D -.-> OPS
     AGENT_D -.->|"6 · Register D"| REGISTRY
@@ -612,6 +664,7 @@ flowchart TB
     classDef ingress fill:#FFF3E0,stroke:#E65100,color:#BF360C,stroke-width:2px
     classDef security fill:#FFEBEE,stroke:#C62828,color:#B71C1C,stroke-width:2px
     classDef agentd fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20,stroke-width:2px
+    classDef lb fill:#FFF3E0,stroke:#EF6C00,color:#E65100,stroke-width:2px
     classDef tool fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C,stroke-width:2px
 
     class DSL,VALIDATE define
@@ -620,6 +673,7 @@ flowchart TB
     class APIGW ingress
     class WAF,SHIELD,AUTH security
     class ENTRY,EXIT,A,B,C agentd
+    class AGENT_LB lb
     class TOOLS tool
 ```
 
@@ -687,6 +741,8 @@ flowchart TB
         APIGW --> WAF --> SHIELD --> AUTH
     end
 
+    AGENT_LB["⚖️ Agent LB\nInstance routing · Circuit breaker\nHealth-aware · Version-aware"]
+
     TOOLS["🔧 MCP Tool Servers"]
     STATE["💾 State & Memory"]
     OPS["📊 Observability & 🛡️ Governance"]
@@ -695,9 +751,10 @@ flowchart TB
     REGISTRY -.->|"discover agents"| ENGINE
     CODE --> AGENT_D
     INGRESS -->|"Call Agent D"| AGENT_D
-    A <-->|"MCP"| TOOLS
-    B <-->|"MCP"| TOOLS
-    C <-->|"MCP"| TOOLS
+    A <-->|"A2A via LB"| AGENT_LB
+    B <-->|"A2A via LB"| AGENT_LB
+    C <-->|"A2A via LB"| AGENT_LB
+    AGENT_LB <-->|"MCP"| TOOLS
     AGENT_D --> STATE
     AGENT_D -.-> OPS
     AGENT_D -.->|"Register D"| REGISTRY
@@ -707,6 +764,7 @@ flowchart TB
     classDef ingress fill:#FFF3E0,stroke:#E65100,color:#BF360C,stroke-width:2px
     classDef security fill:#FFEBEE,stroke:#C62828,color:#B71C1C,stroke-width:2px
     classDef agent fill:#E8F5E9,stroke:#2E7D32,color:#1B5E20,stroke-width:2px
+    classDef lb fill:#FFF3E0,stroke:#EF6C00,color:#E65100,stroke-width:2px
     classDef tool fill:#F3E5F5,stroke:#6A1B9A,color:#4A148C,stroke-width:2px
     classDef state fill:#E0F7FA,stroke:#00838F,color:#006064,stroke-width:2px
     classDef ops fill:#FBE9E7,stroke:#BF360C,color:#BF360C,stroke-width:2px
@@ -716,6 +774,7 @@ flowchart TB
     class APIGW ingress
     class WAF,SHIELD,AUTH security
     class A,B,C,EXIT agent
+    class AGENT_LB lb
     class TOOLS tool
     class STATE state
     class OPS ops
@@ -905,6 +964,7 @@ flowchart LR
 | **Who deploys Agent D** | N/A — engine calls agents directly | Central platform compiles + deploys | Team builds + deploys |
 | **Runtime model** | Engine steps through agents per-request | Single pre-compiled unit | Team's agent with embedded engine |
 | **Caller experience** | Call a workflow endpoint | Call Agent D endpoint | Call Agent D endpoint |
+| **Agent LB** | Engine → Agent LB → agent instances | Agent D → Agent LB → agent instances | SDK → Agent LB → agent instances |
 | **Latency** | Highest (inter-service hops per step) | Lowest (co-located) | Medium (A2A calls but from one process) |
 | **Failure recovery** | Built-in (engine persists per-step) | Needs compiler-injected checkpoints | SDK provides checkpointing |
 | **Hot-swap agents** | Trivial (registry pointer change) | Requires recompile + redeploy | Team redeploys with updated SDK call |
